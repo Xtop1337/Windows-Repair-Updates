@@ -206,6 +206,53 @@ Describe 'Журналы и рекомендации' {
     }
 }
 
+Describe 'Registry.pol (локальная групповая политика)' {
+    BeforeAll {
+        function New-PolEntry([string]$Key, [string]$Value, [int]$Dword) {
+            $u = [Text.Encoding]::Unicode
+            $ms = New-Object IO.MemoryStream
+            $w = { param([byte[]]$b) $ms.Write($b, 0, $b.Length) }
+            & $w $u.GetBytes('[')
+            & $w $u.GetBytes($Key + [char]0)
+            & $w $u.GetBytes(';')
+            & $w $u.GetBytes($Value + [char]0)
+            & $w $u.GetBytes(';')
+            & $w ([BitConverter]::GetBytes([uint32]4))
+            & $w $u.GetBytes(';')
+            & $w ([BitConverter]::GetBytes([uint32]4))
+            & $w $u.GetBytes(';')
+            & $w ([BitConverter]::GetBytes([uint32]$Dword))
+            & $w $u.GetBytes(']')
+            return ,$ms.ToArray()
+        }
+        $hdr = [byte[]](0x50, 0x52, 0x65, 0x67, 1, 0, 0, 0)
+        $e1 = New-PolEntry 'Software\Policies\Microsoft\Windows\WindowsUpdate\AU' 'NoAutoUpdate' 1
+        $e2 = New-PolEntry 'Software\Policies\Microsoft\Windows\Personalization' 'NoLockScreen' 1
+        $e3 = New-PolEntry 'Software\Policies\Microsoft\Windows\WindowsUpdate' 'DisableWindowsUpdateAccess' 1
+        $script:PolBytes = [byte[]]($hdr + $e1 + $e2 + $e3)
+        $script:PolE2 = $e2
+    }
+    It 'разбирает записи' {
+        $e = @(Get-RegistryPolEntries $script:PolBytes)
+        $e.Count | Should -Be 3
+        $e[0].Value | Should -Be 'NoAutoUpdate'
+        $e[1].Key | Should -Be 'Software\Policies\Microsoft\Windows\Personalization'
+    }
+    It 'удаляет только запреты обновлений, остальное сохраняет байт в байт' {
+        $pairs = @('SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU|NoAutoUpdate', 'SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate|DisableWindowsUpdateAccess')
+        $r = Remove-RegistryPolEntries -Bytes $script:PolBytes -Pairs $pairs
+        $r.Removed | Should -Be 2
+        $left = @(Get-RegistryPolEntries $r.Bytes)
+        $left.Count | Should -Be 1
+        $left[0].Value | Should -Be 'NoLockScreen'
+        $r.Bytes.Length | Should -Be (8 + $script:PolE2.Length)
+    }
+    It 'повреждённый файл даёт понятную ошибку' {
+        { Get-RegistryPolEntries ([byte[]](0x50, 0x52, 0x65, 0x67, 1, 0, 0, 0, 0x41, 0)) } | Should -Throw
+        { Get-RegistryPolEntries ([byte[]](1, 2, 3, 4, 5, 6, 7, 8, 9)) } | Should -Throw
+    }
+}
+
 Describe 'Исходники' {
     BeforeAll {
         $root = Split-Path -Parent $PSScriptRoot

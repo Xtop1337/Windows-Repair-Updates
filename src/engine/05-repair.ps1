@@ -103,21 +103,78 @@ function Repair-Services {
 }
 
 # ---------------------------------------------------------------------
-function Test-RegistryPolContains {
-    param([string]$Path, [string[]]$Names)
-    if (-not (Test-Path -LiteralPath $Path)) { return $false }
-    try {
-        $text = [Text.Encoding]::Unicode.GetString([IO.File]::ReadAllBytes($Path))
-        foreach ($n in $Names) { if ($text.IndexOf($n, [StringComparison]::OrdinalIgnoreCase) -ge 0) { return $true } }
-    } catch { }
-    return $false
+# Разбор файла локальной групповой политики Registry.pol
+# Формат: 'PReg' + версия (8 байт), затем записи [ключ;значение;тип;размер;данные]
+# (строки — UTF-16LE с нулём в конце, разделители — символы UTF-16LE).
+function Get-RegistryPolEntries {
+    param([byte[]]$Bytes)
+    $entries = @()
+    if (-not $Bytes -or $Bytes.Length -lt 8) { return $entries }
+    if ([Text.Encoding]::ASCII.GetString($Bytes, 0, 4) -ne 'PReg') { throw 'Файл не похож на Registry.pol' }
+    $n = $Bytes.Length
+    $i = 8
+    $readStr = {
+        $sb = New-Object Text.StringBuilder
+        while ($script:polPos + 1 -lt $n) {
+            $ch = [BitConverter]::ToChar($Bytes, $script:polPos)
+            $script:polPos += 2
+            if ($ch -eq [char]0) { break }
+            [void]$sb.Append($ch)
+        }
+        $sb.ToString()
+    }
+    $expect = {
+        param([char]$c)
+        if ($script:polPos + 1 -ge $n -or [BitConverter]::ToChar($Bytes, $script:polPos) -ne $c) { throw ("Повреждён Registry.pol (позиция " + $script:polPos + ")") }
+        $script:polPos += 2
+    }
+    $script:polPos = $i
+    while ($script:polPos + 1 -lt $n) {
+        $start = $script:polPos
+        & $expect '['
+        $key = & $readStr
+        & $expect ';'
+        $val = & $readStr
+        & $expect ';'
+        $type = [BitConverter]::ToUInt32($Bytes, $script:polPos); $script:polPos += 4
+        & $expect ';'
+        $size = [BitConverter]::ToUInt32($Bytes, $script:polPos); $script:polPos += 4
+        & $expect ';'
+        $script:polPos += [int]$size
+        & $expect ']'
+        $entries += [pscustomobject]@{ Key = $key; Value = $val; Type = $type; Size = $size; Start = $start; End = $script:polPos }
+    }
+    return $entries
+}
+
+# Убирает из Registry.pol записи с указанными парами «ключ|значение»
+# (сравнение без учёта регистра). Возвращает новые байты и число удалённых.
+function Remove-RegistryPolEntries {
+    param([byte[]]$Bytes, [string[]]$Pairs)
+    $set = @{}
+    foreach ($p in $Pairs) { $set[$p.ToLowerInvariant()] = $true }
+    $entries = @(Get-RegistryPolEntries $Bytes)
+    $out = New-Object IO.MemoryStream
+    $out.Write($Bytes, 0, 8)
+    $removed = 0
+    foreach ($e in $entries) {
+        $k = ($e.Key.TrimStart('\') + '|' + $e.Value).ToLowerInvariant()
+        if ($set.ContainsKey($k)) { $removed++; continue }
+        $out.Write($Bytes, $e.Start, $e.End - $e.Start)
+    }
+    return [pscustomobject]@{ Bytes = $out.ToArray(); Removed = $removed }
+}
+
+function Get-PolicyRelativeKey {
+    param([string]$Path)
+    return ($Path -replace '^(HKLM|HKCU):\\', '')
 }
 
 function Repair-Policies {
     Write-Log 'Убираю политики, запрещающие обновления…' 'STEP'
     $removed = 0
     $failed = 0
-    $names = @()
+    $polPairs = @{ Machine = @(); User = @() }
     foreach ($c in $script:PolicyChecks) {
         if ($c.Area -eq 'Defender') { continue }
         if (-not (Test-RegValue $c.P $c.N)) { continue }
@@ -128,13 +185,17 @@ function Repair-Policies {
         [void](Backup-RegKey $c.P)
         $list = @($c.N)
         if ($script:PolicyCompanions.ContainsKey($c.N)) { $list += $script:PolicyCompanions[$c.N] }
+        $scope = 'Machine'
+        if ($c.P -like 'HKCU:*') { $scope = 'User' }
         foreach ($n in $list) {
+            $polPairs[$scope] += ((Get-PolicyRelativeKey $c.P) + '|' + $n)
             if (-not (Test-RegValue $c.P $n)) { continue }
-            if (Remove-RegValueForce $c.P $n) { $removed++; $names += $n; Write-Log ('Удалено: ' + (ConvertTo-NativeRegPath $c.P) + '\' + $n) 'OK' }
+            if (Remove-RegValueForce $c.P $n) { $removed++; Write-Log ('Удалено: ' + (ConvertTo-NativeRegPath $c.P) + '\' + $n) 'OK' }
             else { $failed++ }
         }
         if ($c.N -eq 'WUServer') {
             $au = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU'
+            $polPairs.Machine += ((Get-PolicyRelativeKey $au) + '|UseWUServer')
             if (Test-RegValue $au 'UseWUServer') { [void](Backup-RegKey $au); if (Remove-RegValueForce $au 'UseWUServer') { $removed++ } }
         }
     }
@@ -147,24 +208,22 @@ function Repair-Policies {
         }
         Write-Log 'Пауза обновлений снята.' 'OK'
     }
-    # Если запреты записаны в локальную групповую политику, они вернутся
-    # при следующем обновлении политик. Предлагаем сбросить её.
-    $polM = Join-Path $env:windir 'System32\GroupPolicy\Machine\Registry.pol'
-    $polU = Join-Path $env:windir 'System32\GroupPolicy\User\Registry.pol'
-    $checkNames = @($script:PolicyChecks | Where-Object { $_.Area -ne 'Defender' } | ForEach-Object { $_.N }) + @('NoWindowsUpdate', 'UseWUServer')
-    if ((Test-RegistryPolContains $polM $checkNames) -or (Test-RegistryPolContains $polU $checkNames)) {
-        $q = 'Запреты обновлений записаны в локальную групповую политику — без её сброса они вернутся.' + "`r`n`r`n" +
-             'Сбросить локальные групповые политики к стандартным? (Резервная копия сохранится. На домашнем компьютере это безопасно.)'
-        if (Request-UserConfirm $q 'Групповая политика') {
-            foreach ($p in @($polM, $polU)) {
-                if (Test-Path -LiteralPath $p) {
-                    $tag = 'gpo_' + (Split-Path (Split-Path $p -Parent) -Leaf) + '_Registry.pol'
-                    [void](Backup-File $p $tag)
-                    try { Remove-Item -LiteralPath $p -Force -ErrorAction Stop; Write-Log ('Сброшено: ' + $p) 'OK' } catch { Write-Log ('Не удалось удалить ' + $p + ': ' + $_.Exception.Message) 'WARN' }
-                }
+    # Если запреты записаны в локальную групповую политику (gpedit), они вернутся
+    # при следующем обновлении политик — убираем из неё ТОЛЬКО эти записи.
+    foreach ($scope in @('Machine', 'User')) {
+        if ($polPairs[$scope].Count -eq 0) { continue }
+        $pol = Join-Path $env:windir ('System32\GroupPolicy\' + $scope + '\Registry.pol')
+        if (-not (Test-Path -LiteralPath $pol)) { continue }
+        try {
+            $r = Remove-RegistryPolEntries -Bytes ([IO.File]::ReadAllBytes($pol)) -Pairs $polPairs[$scope]
+            if ($r.Removed -gt 0) {
+                if (-not (Backup-File $pol ('gpo_' + $scope + '_Registry.pol'))) { throw 'не удалось сохранить резервную копию' }
+                [IO.File]::WriteAllBytes($pol, $r.Bytes)
+                Write-Log ('Из локальной групповой политики (' + $scope + ') убрано запретов: ' + $r.Removed + '. Остальные политики не тронуты.') 'OK'
             }
-            [void](Invoke-Proc 'gpupdate.exe' '/force' -TimeoutSec 180 -Quiet)
-            Write-Log 'Групповые политики обновлены.' 'OK'
+        } catch {
+            $failed++
+            Write-Log ('Не удалось изменить локальную групповую политику ' + $pol + ': ' + $_.Exception.Message) 'WARN'
         }
     }
     if ($removed -eq 0 -and $failed -eq 0) { Write-Log 'Запрещающих политик не найдено.' 'OK' }

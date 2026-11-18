@@ -46,14 +46,17 @@ jobs:
         run: ./build/Build.ps1 -Version $env:VERSION
 
       - name: Интеграционный тест (сломать → найти → починить)
+        timeout-minutes: 30
         shell: powershell
         run: ./tests/Integration.Windows.ps1
 
       - name: Смоук-тест окна (.ps1)
+        timeout-minutes: 12
         shell: powershell
         run: ./tests/UiSmoke.ps1 -Script dist/WURepair.ps1 -Out screenshots/ui-ps1.png
 
       - name: Смоук-тест окна (.exe)
+        timeout-minutes: 12
         shell: powershell
         run: ./tests/UiSmoke.ps1 -Exe dist/WURepair.exe -Out screenshots/ui-exe.png
 
