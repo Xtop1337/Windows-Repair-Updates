@@ -163,6 +163,7 @@ function Register-AppxManifest {
     } catch {
         $h = Get-HResultFromError $_
         Write-Log ('   не удалось зарегистрировать ' + (Split-Path (Split-Path $Manifest -Parent) -Leaf) + ': ' + $h + ' — ' + (Get-ErrorInfo $h).Text) 'DEBUG'
+        Write-Log ('   подробно: ' + (Get-ErrorText $_)) 'DEBUG'
         return $false
     }
 }
@@ -262,7 +263,10 @@ function Install-AppInstallerFromGitHub {
                     } catch {
                         $h = Get-HResultFromError $_
                         if ($h -in @('0x80073D06', '0x80073CFB')) { Write-Log ('Компонент уже есть: ' + $f.Name) 'INFO' }
-                        else { Write-Log ('Компонент ' + $f.Name + ': ' + $h + ' — ' + (Get-ErrorInfo $h).Text) 'WARN' }
+                        else {
+                            Write-Log ('Компонент ' + $f.Name + ': ' + $h + ' — ' + (Get-ErrorInfo $h).Text) 'WARN'
+                            Write-Log ('   подробно: ' + (Get-ErrorText $_)) 'DEBUG'
+                        }
                     }
                 }
             } catch { Write-Log ('Не удалось распаковать зависимости: ' + $_.Exception.Message) 'WARN' }
@@ -277,6 +281,7 @@ function Install-AppInstallerFromGitHub {
         $h = Get-HResultFromError $_
         if ($h -notin @('0x80073D06', '0x80073CFB')) {
             Write-Log ('Не удалось установить «Установщик приложений»: ' + $h + ' — ' + (Get-ErrorInfo $h).Text) 'ERROR'
+            Write-Log ('   подробно: ' + (Get-ErrorText $_)) 'INFO'
             return $false
         }
         Write-Log '«Установщик приложений» уже установлен.' 'OK'
@@ -506,10 +511,30 @@ function Start-ClaudeApp {
     } catch { return $false }
 }
 
+# Остатки прошлой неудачной установки Claude (ошибка 0x80073CF6)
+function Remove-ClaudeRemnants {
+    $n = 0
+    try {
+        foreach ($p in @(Get-AppxPackage -AllUsers -Name 'Claude' -ErrorAction Stop)) {
+            try { Remove-AppxPackage -Package $p.PackageFullName -AllUsers -ErrorAction Stop; $n++ } catch {
+                try { Remove-AppxPackage -Package $p.PackageFullName -ErrorAction Stop; $n++ } catch { Write-Log ('   не удалось удалить ' + $p.PackageFullName + ': ' + (Get-ErrorText $_)) 'DEBUG' }
+            }
+        }
+    } catch { }
+    try {
+        foreach ($p in @(Get-AppxProvisionedPackage -Online -ErrorAction Stop | Where-Object { $_.DisplayName -eq 'Claude' })) {
+            try { Remove-AppxProvisionedPackage -Online -PackageName $p.PackageName -ErrorAction Stop | Out-Null; $n++ } catch { }
+        }
+    } catch { }
+    if ($n -gt 0) { Write-Log ('Удалены остатки прошлой установки Claude (' + $n + ').') 'OK' }
+    return $n
+}
+
 function Install-ClaudePackage {
     param([string]$File)
     $sideloadTried = $false
     $servicesTried = $false
+    $cleanupTried = $false
     $provisioned = $false
     for ($attempt = 1; $attempt -le 3 -and -not $provisioned; $attempt++) {
         try {
@@ -521,7 +546,17 @@ function Install-ClaudePackage {
             $code = Get-HResultFromError $_
             $info = Get-ErrorInfo $code
             Write-Log ('Ошибка установки: ' + $code + ' — ' + $info.Text) 'ERROR'
+            Write-Log ('   подробно: ' + (Get-ErrorText $_ 600)) 'INFO'
             if ($code -in @('0x80073CFF', '0x80073D00', '0x80073D01') -and -not $sideloadTried) { $sideloadTried = $true; [void](Repair-Sideload); continue }
+            if ($code -in @('0x80073CF6', '0x80073CF3', '0x80073D05') -and -not $cleanupTried) {
+                $cleanupTried = $true
+                $q = 'Установке мешают остатки прошлой неудачной установки Claude.' + "`r`n`r`n" +
+                     'Удалить их и попробовать ещё раз? (Если Claude раньше запускался, его настройки и вход в аккаунт сбросятся.)'
+                if (Request-UserConfirm $q 'Claude Desktop') {
+                    [void](Remove-ClaudeRemnants)
+                    continue
+                }
+            }
             if ($code -in @('0x80073D0A', '0x80073CF9', '0x800706BA') -and -not $servicesTried) { $servicesTried = $true; [void](Repair-Services -Groups @('Store')); continue }
             if ($code -eq '0x80073CFB') { Write-Log 'Эта версия Claude уже установлена.' 'OK'; $provisioned = $true; break }
             if ($code -eq '0x80073CF6') { Write-Log 'Перезагрузите компьютер и снова нажмите «Установить Claude Desktop».' 'WARN'; return $false }

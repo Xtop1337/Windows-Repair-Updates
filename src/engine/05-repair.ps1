@@ -39,7 +39,12 @@ function Repair-ServiceEntry {
     $img = [string](Get-RegValue $key 'ImagePath')
     $needAcc = ($Entry.A -and $obj -and ((ConvertTo-AccountKey $obj) -ne (ConvertTo-AccountKey $Entry.A)))
     $needImg = ($Entry.Img -and $Entry.Exe -and ((-not $img) -or ($img -notmatch [regex]::Escape($Entry.Exe))))
-    if ($start -ne 4 -and -not $needAcc -and -not $needImg) { return $true }
+    $locked = Test-HklmKeyLocked ('SYSTEM\CurrentControlSet\Services\' + $name)
+    if ($start -ne 4 -and -not $needAcc -and -not $needImg -and -not $locked) { return $true }
+    if ($locked) {
+        # Сначала снимаем блокировку прав, иначе ключ не изменить даже от имени SYSTEM
+        if (-not (Unlock-ServiceKey $name)) { $ok = $false }
+    }
     [void](Backup-RegKey $key ('svc_' + $name))
 
     if ($start -eq 4) {
@@ -98,7 +103,7 @@ function Repair-Services {
     }
     if (-not (Repair-ServiceSecurity)) { $ok = $false }
     foreach ($n in @('CryptSvc', 'BITS', 'wuauserv')) { [void](Start-ServiceSafe $n) }
-    if ($ok) { Write-Log 'Службы в порядке.' 'OK' }
+    if ($ok) { Write-Log 'Службы в порядке.' 'INFO' }
     return $ok
 }
 
@@ -226,7 +231,7 @@ function Repair-Policies {
             Write-Log ('Не удалось изменить локальную групповую политику ' + $pol + ': ' + $_.Exception.Message) 'WARN'
         }
     }
-    if ($removed -eq 0 -and $failed -eq 0) { Write-Log 'Запрещающих политик не найдено.' 'OK' }
+    if ($removed -eq 0 -and $failed -eq 0) { Write-Log 'Запрещающих политик не найдено.' 'INFO' }
     return ($failed -eq 0)
 }
 
@@ -288,24 +293,38 @@ function Get-RepairedHostsLines {
 function Repair-Hosts {
     Write-Log 'Очищаю файл hosts от блокировок серверов Microsoft…' 'STEP'
     $path = Get-HostsPath
-    if (-not (Test-Path -LiteralPath $path)) { Write-Log 'Файла hosts нет — чистить нечего.' 'OK'; return $true }
+    if (-not (Test-Path -LiteralPath $path)) { Write-Log 'Файла hosts нет — чистить нечего.' 'INFO'; return $true }
     $data = Read-TextFileSmart $path
     $fixed = Get-RepairedHostsLines -Lines $data.Lines
-    if ($fixed.Removed -eq 0) { Write-Log 'Блокировок в hosts нет.' 'OK'; return $true }
+    if ($fixed.Removed -eq 0) { Write-Log 'Блокировок в hosts нет.' 'INFO'; return $true }
     if (-not (Backup-File $path 'hosts')) {
         Write-Log 'Не удалось сделать копию hosts — изменять его не буду.' 'ERROR'
         return $false
     }
+    $content = (($fixed.Lines -join "`r`n") + "`r`n")
+    $written = $false
     try {
         $item = Get-Item -LiteralPath $path -Force
         if ($item.Attributes -band [IO.FileAttributes]::ReadOnly) {
             $item.Attributes = $item.Attributes -band (-bnot [IO.FileAttributes]::ReadOnly)
             Write-Log 'С файла hosts снят атрибут «только чтение».' 'INFO'
         }
-        [IO.File]::WriteAllText($path, (($fixed.Lines -join "`r`n") + "`r`n"), $data.Encoding)
+        [IO.File]::WriteAllText($path, $content, $data.Encoding)
+        $written = $true
     } catch {
-        Write-Log ('Не удалось записать hosts: ' + $_.Exception.Message) 'ERROR'
-        Write-Log 'Скорее всего, файл защищает антивирус. Отключите в нём самозащиту/«защиту файла hosts» и повторите.' 'WARN'
+        Write-Log ('Обычная запись hosts не удалась (' + $_.Exception.Message + ') — пробую от имени SYSTEM…') 'INFO'
+    }
+    if (-not $written) {
+        $tmp = Join-Path $script:RootDir 'hosts.new'
+        try { [IO.File]::WriteAllText($tmp, $content, $data.Encoding) } catch { }
+        if ((Test-Path -LiteralPath $tmp) -and ((Invoke-AsSystem ('attrib -r -s -h "' + $path + '" & copy /y "' + $tmp + '" "' + $path + '"')) -eq 0)) {
+            $written = $true
+        }
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+    }
+    if (-not $written) {
+        Write-Log 'Не удалось записать файл hosts.' 'ERROR'
+        Write-Log 'Его защищает антивирус: в Kaspersky откройте «Настройки → Безопасность → Самозащита» и временно выключите её, затем повторите.' 'WARN'
         return $false
     }
     $left = @(Get-HostsBlockEntries -Lines (Read-TextFileSmart $path).Lines).Count
@@ -322,7 +341,7 @@ function Repair-Routes {
     Write-Log 'Удаляю «мёртвые» сетевые маршруты…' 'STEP'
     $k = 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\PersistentRoutes'
     $bh = @(Get-BlackholeRoutes (Get-PersistentRouteNames))
-    if ($bh.Count -eq 0) { Write-Log 'Таких маршрутов нет.' 'OK'; return $true }
+    if ($bh.Count -eq 0) { Write-Log 'Таких маршрутов нет.' 'INFO'; return $true }
     [void](Backup-RegKey $k 'persistent_routes')
     $n = 0
     foreach ($r in $bh) {
@@ -368,9 +387,20 @@ function Repair-Firewall {
 }
 
 function Repair-Proxy {
+    param([switch]$Force)
+    $st = Test-ProxyAlive
+    if (-not $st) { Write-Log 'Прокси WinHTTP не задан.' 'INFO'; return $true }
+    if ($st.Alive -and -not $Force) {
+        Write-Log ('Прокси ' + $st.Proxy + ' работает — не трогаю (через него идут обновления).') 'INFO'
+        return $true
+    }
+    if (-not $Force) {
+        $q = 'Центр обновления настроен ходить в интернет через ' + $st.Proxy + ', но этот адрес не отвечает (скорее всего, выключен VPN).' + "`r`n`r`n" +
+             '«Да» — сбросить прокси: обновления пойдут напрямую, без VPN.' + "`r`n" + '«Нет» — оставить как есть (тогда включите VPN и запустите ремонт снова).'
+        if (-not (Request-UserConfirm $q 'Прокси / VPN')) { Write-Log 'Прокси оставлен как есть — включите VPN.' 'INFO'; return 'skip' }
+    }
     Write-Log 'Сбрасываю системный прокси WinHTTP…' 'STEP'
     $p = Get-WinHttpProxy
-    if (-not $p.Proxy) { Write-Log 'Прокси WinHTTP не задан.' 'OK'; return $true }
     [void](Backup-RegKey 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Internet Settings\Connections' 'winhttp_proxy')
     $r = Invoke-Proc 'netsh.exe' 'winhttp reset proxy' -TimeoutSec 30 -Quiet
     if ($r.ExitCode -eq 0) { Write-Log ('Прокси ' + $p.Proxy + ' сброшен.') 'OK'; return $true }
@@ -405,7 +435,7 @@ function Repair-Network {
     [void](Invoke-Proc 'ipconfig.exe' '/flushdns' -TimeoutSec 30 -Quiet)
     $wu = @($script:ConnectivityTargets | Where-Object { $_.Need -eq 'WU' } | Select-Object -First 3)
     $fail = @($wu | Where-Object { -not (Test-TcpEndpoint $_.H $_.P).Ok })
-    if ($fail.Count -eq 0) { Write-Log 'Серверы Microsoft доступны.' 'OK'; return $true }
+    if ($fail.Count -eq 0) { Write-Log 'Серверы Microsoft доступны.' 'INFO'; return $true }
     $q = 'Серверы Microsoft всё ещё недоступны. Можно сбросить сетевой стек Winsock (помогает при «сломанных» сетевых настройках, нужна перезагрузка).' + "`r`n`r`nСбросить Winsock?"
     if (Request-UserConfirm $q 'Сеть') {
         $r = Invoke-Proc 'netsh.exe' 'winsock reset' -TimeoutSec 60 -Quiet
@@ -580,6 +610,12 @@ function Repair-ComponentStore {
             }
         }
     }
+    if (-not (Test-Path -LiteralPath (Resolve-SystemExe 'sfc.exe'))) { [void](Repair-MissingFiles) }
+    if (-not (Test-Path -LiteralPath (Resolve-SystemExe 'sfc.exe'))) {
+        Write-Log 'Программы sfc.exe нет в системе — проверку SFC пропускаю (её вернёт обновление Windows поверх).' 'WARN'
+        Set-UiProgress -1
+        return $dismOk
+    }
     Write-Log 'SFC: проверка системных файлов…' 'STEP'
     Set-UiStatus 'SFC: проверка системных файлов… (не выключайте компьютер)'
     Set-UiProgress 0
@@ -590,10 +626,63 @@ function Repair-ComponentStore {
     return $dismOk
 }
 
+# ---------------------------------------------------------------------
+#  Удалённые системные файлы: в WinSxS обычно остаётся их копия
+# ---------------------------------------------------------------------
+function Get-WinSxSArchPrefix {
+    switch (Get-ArchName) { 'x64' { return 'amd64' } 'arm64' { return 'arm64' } default { return 'x86' } }
+}
+
+function Find-WinSxSFile {
+    param([string]$FileName)
+    $sxs = Join-Path $env:windir 'WinSxS'
+    $best = $null
+    $bestVer = [version]'0.0'
+    try { $dirs = [IO.Directory]::GetDirectories($sxs, (Get-WinSxSArchPrefix) + '_*') } catch { return $null }
+    foreach ($d in $dirs) {
+        $f = Join-Path $d $FileName
+        if (-not [IO.File]::Exists($f)) { continue }
+        $v = [version]'0.0'
+        $m = [regex]::Match([IO.Path]::GetFileName($d), '_(\d+\.\d+\.\d+\.\d+)_')
+        if ($m.Success) { try { $v = [version]$m.Groups[1].Value } catch { } }
+        if ($v -ge $bestVer) { $bestVer = $v; $best = $f }
+    }
+    return $best
+}
+
+function Repair-MissingFiles {
+    Write-Log 'Возвращаю удалённые системные файлы из хранилища компонентов (WinSxS)…' 'STEP'
+    $info = $script:LastSysInfo
+    if (-not $info) { $info = Get-SystemInfo }
+    $ok = $true
+    foreach ($c in $script:CriticalFiles) {
+        if ($c.MinBuild -and $info.Build -lt $c.MinBuild) { continue }
+        $dst = Join-Path $env:windir $c.P
+        if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess) { $dst = $dst -replace '\\System32\\', '\Sysnative\' }
+        if (Test-Path -LiteralPath $dst) { continue }
+        $src = Find-WinSxSFile ([IO.Path]::GetFileName($c.P))
+        if (-not $src) {
+            Write-Log ('Файла ' + $c.P + ' нет и в хранилище компонентов — его вернёт обновление Windows поверх.') 'WARN'
+            $ok = $false
+            continue
+        }
+        $copied = $false
+        try { Copy-Item -LiteralPath $src -Destination $dst -Force -ErrorAction Stop; $copied = $true } catch { }
+        if (-not $copied) { $copied = (((Invoke-AsSystem ('copy /y "' + $src + '" "' + $dst + '"')) -eq 0) -and (Test-Path -LiteralPath $dst)) }
+        if ($copied) { Write-Log ('Восстановлен файл ' + $c.P + ' (из ' + (Split-Path (Split-Path $src -Parent) -Leaf) + ')') 'OK' }
+        else { $ok = $false; Write-Log ('Не удалось вернуть файл ' + $c.P) 'WARN' }
+    }
+    return $ok
+}
+
 function Repair-Sideload {
     Write-Log 'Разрешаю установку доверенных приложений MSIX (не из Магазина)…' 'STEP'
     $k = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock'
     $pol = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Appx'
+    if ((Get-RegValue $k 'AllowAllTrustedApps') -eq 1 -and (Get-RegValue $pol 'AllowAllTrustedApps') -ne 0) {
+        Write-Log 'Установка доверенных приложений уже разрешена.' 'INFO'
+        return $true
+    }
     [void](Backup-RegKey $k 'appmodelunlock')
     [void](Backup-RegKey $pol 'policy_appx')
     $ok = Set-RegValue $k 'AllowAllTrustedApps' 1 'DWord'
@@ -645,7 +734,7 @@ function Hide-ProblemUpdate {
             if (@($u.KBArticleIDs) -contains ($Kb -replace '^KB', '')) { $u.IsHidden = $true; $n++ }
         }
         if ($n -gt 0) { Write-Log ($Kb + ' скрыто — Windows больше не будет пытаться его ставить.') 'OK' }
-        else { Write-Log ($Kb + ' среди доступных обновлений нет.') 'OK' }
+        else { Write-Log ($Kb + ' среди доступных обновлений нет.') 'INFO' }
         return $true
     } catch {
         Write-Log ('Не удалось скрыть ' + $Kb + ': ' + $_.Exception.Message) 'WARN'
@@ -679,7 +768,6 @@ function Invoke-AutoRepair {
     [void](Get-SessionBackupDir)
     [void](New-SafetyRestorePoint)
 
-    $netProblem = @($ids | Where-Object { $_ -in @('net-blocked', 'net-none') }).Count -gt 0
     $plan = @(
         @{ F = 'IFEO';      N = 'Блокировки запуска (IFEO)';         S = { Repair-Ifeo } }
         @{ F = 'Policies';  N = 'Политики';                          S = { Repair-Policies } }
@@ -689,36 +777,44 @@ function Invoke-AutoRepair {
         @{ F = 'Routes';    N = 'Сетевые маршруты';                  S = { Repair-Routes } }
         @{ F = 'Firewall';  N = 'Брандмауэр';                        S = { Repair-Firewall } }
         @{ F = 'Time';      N = 'Время';                             S = { Repair-Time } }
-        @{ F = 'Proxy';     N = 'Прокси';                            S = { if ($netProblem) { Repair-Proxy } else { Write-Log 'Прокси не трогаю: серверы Microsoft доступны.' 'INFO'; $true } } }
+        @{ F = 'Proxy';     N = 'Прокси / VPN';                      S = { Repair-Proxy } }
         @{ F = 'Network';   N = 'Сеть';                              S = { Repair-Network } }
         @{ F = 'ResetWU';   N = 'Сброс компонентов Центра обновления'; S = { Reset-WUComponents } }
         @{ F = 'Sideload';  N = 'Установка приложений MSIX';         S = { Repair-Sideload } }
         @{ F = 'KB5034441'; N = 'Проблемное обновление KB5034441';   S = { Hide-ProblemUpdate 'KB5034441' } }
         @{ F = 'Defender';  N = 'Защитник Windows';                  S = { Repair-Defender -Light } }
         @{ F = 'Disk';      N = 'Место на диске';                    S = { Repair-DiskSpace } }
+        @{ F = 'Files';     N = 'Удалённые системные файлы';         S = { Repair-MissingFiles } }
         @{ F = 'DISM';      N = 'Глубокое восстановление (DISM + SFC)'; S = {
                 if (Request-UserConfirm 'Найдены признаки повреждения системных файлов. Запустить глубокое восстановление DISM + SFC? Это займёт 20–60 минут, компьютер выключать нельзя.' 'Глубокое восстановление') { Repair-ComponentStore }
-                else { Write-Log 'Глубокое восстановление пропущено (можно запустить отдельной кнопкой).' 'INFO'; $true } } }
+                else { Write-Log 'Глубокое восстановление пропущено (можно запустить отдельной кнопкой).' 'INFO'; 'skip' } } }
         @{ F = 'Store';     N = 'Microsoft Store';                   S = {
                 if (Request-UserConfirm 'Microsoft Store удалён или не работает. Восстановить его сейчас? (Понадобится скачать около 100–200 МБ.)' 'Microsoft Store') { Restore-MicrosoftStore }
-                else { Write-Log 'Восстановление Магазина пропущено (можно запустить отдельной кнопкой).' 'INFO'; $true } } }
+                else { Write-Log 'Восстановление Магазина пропущено (можно запустить отдельной кнопкой).' 'INFO'; 'skip' } } }
     )
-    $done = @(); $failed = @()
+    $done = @(); $failed = @(); $skipped = @(); $checked = @()
     $i = 0
     $todo = @($plan | Where-Object { $fixes -contains $_.F })
     foreach ($p in $todo) {
         $i++
         Set-UiStatus ('Ремонт (' + $i + ' из ' + $todo.Count + '): ' + $p.N)
         Set-UiProgress -1
-        $ok = $false
-        try { $ok = [bool](@(& $p.S)[-1]) } catch { Write-Log ($p.N + ': ' + $_.Exception.Message) 'ERROR' }
-        if ($ok) { $done += $p.N } else { $failed += $p.N }
+        $before = $script:OkLogCount
+        $res = $false
+        try { $res = @(& $p.S)[-1] } catch { Write-Log ($p.N + ': ' + $_.Exception.Message) 'ERROR'; $res = $false }
+        $changed = ($script:OkLogCount -gt $before)
+        if ($res -is [string] -and $res -eq 'skip') { $skipped += $p.N }
+        elseif (-not $res) { if ($changed) { $failed += ($p.N + ' (частично)') } else { $failed += $p.N } }
+        elseif ($changed) { $done += $p.N }
+        else { $checked += $p.N }
     }
     Write-Log '--- Повторная диагностика после ремонта ---' 'STEP'
     $after = Invoke-Diagnostics -Quiet
-    $script:RepairSummary = [pscustomobject]@{ Done = $done; Failed = $failed; Remaining = $after.Errors; Fixes = $after.Fixes }
-    Write-Log ('Исправлено: ' + ($(if ($done.Count) { $done -join ', ' } else { 'ничего' }))) 'OK'
-    if ($failed.Count -gt 0) { Write-Log ('Не получилось полностью: ' + ($failed -join ', ')) 'WARN' }
+    $script:RepairSummary = [pscustomobject]@{ Done = $done; Failed = $failed; Skipped = $skipped; Checked = $checked; Remaining = $after.Errors; Fixes = $after.Fixes }
+    Write-Log ('Исправлено: ' + ($(if ($done.Count) { $done -join ', ' } else { 'ничего' }))) 'INFO'
+    if ($checked.Count -gt 0) { Write-Log ('Проверено, менять не понадобилось: ' + ($checked -join ', ')) 'INFO' }
+    if ($skipped.Count -gt 0) { Write-Log ('Пропущено по вашему выбору: ' + ($skipped -join ', ')) 'INFO' }
+    if ($failed.Count -gt 0) { Write-Log ('Не получилось: ' + ($failed -join ', ')) 'WARN' }
     if ($after.Errors -eq 0) {
         Write-Log 'Ошибок больше нет. Теперь нажмите «Найти и установить обновления».' 'OK'
     } else {

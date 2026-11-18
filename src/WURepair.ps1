@@ -584,7 +584,8 @@ Add-SectionLabel 'ОСНОВНОЕ — по порядку'
         if (-not $r) { return }
         $t = 'Ремонт завершён.' + "`r`n`r`n"
         if ($r.Done.Count) { $t += 'Исправлено: ' + ($r.Done -join ', ') + "`r`n" }
-        if ($r.Failed.Count) { $t += 'Не до конца: ' + ($r.Failed -join ', ') + "`r`n" }
+        if ($r.Skipped.Count) { $t += 'Пропущено по вашему выбору: ' + ($r.Skipped -join ', ') + "`r`n" }
+        if ($r.Failed.Count) { $t += 'Не получилось: ' + ($r.Failed -join ', ') + "`r`n" }
         $t += "`r`nОсталось ошибок: " + $r.Remaining
         if ($r.Remaining -eq 0) { $t += "`r`n`r`nТеперь нажмите «3. Найти и установить обновления»." }
         elseif ($r.Fixes -contains 'InPlace') { $t += "`r`n`r`nОставшиеся проблемы надёжно решает «Обновить Windows поверх»." }

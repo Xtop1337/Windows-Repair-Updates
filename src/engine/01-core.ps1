@@ -22,6 +22,7 @@ $script:RestorePointDone = $false
 $script:LogFile = $null
 $script:LastFindings = @()
 $script:LastSysInfo = $null
+$script:OkLogCount = 0      # сколько реальных изменений записано в журнал (уровень OK)
 
 # TLS 1.2 нужен для загрузок с сайтов Microsoft/GitHub/claude.ai
 try {
@@ -54,6 +55,7 @@ function Write-Log {
         [Parameter(Position = 0)][AllowEmptyString()][string]$Message,
         [Parameter(Position = 1)][ValidateSet('INFO', 'OK', 'WARN', 'ERROR', 'STEP', 'DEBUG')][string]$Level = 'INFO'
     )
+    if ($Level -eq 'OK') { $script:OkLogCount++ }
     $line = '{0} [{1}] {2}' -f (Get-Date -Format 'HH:mm:ss'), $Level, $Message
     if ($script:LogFile) {
         try { [IO.File]::AppendAllText($script:LogFile, $line + "`r`n", [Text.Encoding]::UTF8) } catch { }
@@ -329,6 +331,145 @@ function Backup-RegKey {
     return $true
 }
 
+# ---------------------------------------------------------------------
+#  Права на ключи реестра (их меняет, например, Windows Update Blocker:
+#  после него служба не включается даже от имени SYSTEM)
+# ---------------------------------------------------------------------
+function Enable-Privilege {
+    param([string[]]$Names)
+    if (-not ('WURepair.TokenPriv' -as [type])) {
+        Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+namespace WURepair {
+    public static class TokenPriv {
+        [StructLayout(LayoutKind.Sequential, Pack = 1)]
+        struct TokPriv { public int Count; public long Luid; public int Attr; }
+        [DllImport("advapi32.dll", SetLastError = true)]
+        static extern bool OpenProcessToken(IntPtr h, int access, out IntPtr token);
+        [DllImport("advapi32.dll", SetLastError = true)]
+        static extern bool LookupPrivilegeValue(string host, string name, out long luid);
+        [DllImport("advapi32.dll", SetLastError = true)]
+        static extern bool AdjustTokenPrivileges(IntPtr token, bool disableAll, ref TokPriv newState, int len, IntPtr prev, IntPtr relen);
+        [DllImport("kernel32.dll")]
+        static extern IntPtr GetCurrentProcess();
+        public static bool Enable(string name) {
+            IntPtr token;
+            if (!OpenProcessToken(GetCurrentProcess(), 0x28, out token)) return false;
+            TokPriv tp; tp.Count = 1; tp.Attr = 2;
+            if (!LookupPrivilegeValue(null, name, out tp.Luid)) return false;
+            if (!AdjustTokenPrivileges(token, false, ref tp, 0, IntPtr.Zero, IntPtr.Zero)) return false;
+            return Marshal.GetLastWin32Error() == 0;
+        }
+    }
+}
+"@
+    }
+    $ok = $true
+    foreach ($n in $Names) { if (-not [WURepair.TokenPriv]::Enable($n)) { $ok = $false } }
+    return $ok
+}
+
+function Get-HklmKeySddl {
+    param([string]$SubPath)
+    try {
+        $k = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($SubPath, [Microsoft.Win32.RegistryKeyPermissionCheck]::Default, [Security.AccessControl.RegistryRights]::ReadPermissions)
+        if (-not $k) { return $null }
+        try { return $k.GetAccessControl([Security.AccessControl.AccessControlSections]'Access,Owner').GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]'Access,Owner') }
+        finally { $k.Close() }
+    } catch { return '' }
+}
+
+# Проверка по тексту SDDL: есть запрещающие записи или у SYSTEM нет права записи.
+function Test-SddlLocked {
+    param($Sddl)   # без [string]: $null («ключа нет») и '' («права не прочитать») — разные случаи
+    if ($null -eq $Sddl) { return $false }
+    $Sddl = [string]$Sddl
+    if ($Sddl -eq '') { return $true }                  # даже прочитать права нельзя
+    $dacl = $Sddl
+    $i = $Sddl.IndexOf('D:')
+    if ($i -ge 0) { $dacl = $Sddl.Substring($i) }
+    $aces = @([regex]::Matches($dacl, '\(([^)]*)\)') | ForEach-Object { $_.Groups[1].Value })
+    foreach ($a in $aces) {
+        $f = $a.Split(';')
+        if ($f.Count -lt 6) { continue }
+        if ($f[0] -eq 'D' -and $f[2] -match 'KA|KW|GA|GW|WD|WO|0x' ) { return $true }
+    }
+    foreach ($a in $aces) {
+        $f = $a.Split(';')
+        if ($f.Count -lt 6) { continue }
+        if ($f[0] -eq 'A' -and $f[5] -eq 'SY' -and $f[1] -notmatch 'IO' -and $f[2] -match 'KA|KW|GA|GW') { return $false }
+    }
+    return $true
+}
+
+function Test-HklmKeyLocked {
+    param([string]$SubPath)
+    return (Test-SddlLocked (Get-HklmKeySddl $SubPath))
+}
+
+# Стандартные права для ключа службы: SYSTEM и Администраторы — полный доступ,
+# Пользователи — чтение (как у обычных служб Windows).
+$script:ServiceKeySddl = 'D:(A;CI;KA;;;SY)(A;CI;KA;;;BA)(A;CI;KR;;;BU)(A;CI;KR;;;AC)'
+
+function Reset-HklmKeyAcl {
+    param([string]$SubPath, [string]$Sddl = $script:ServiceKeySddl)
+    $rk = [Microsoft.Win32.Registry]::LocalMachine
+    $perm = [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree
+    $admins = New-Object Security.Principal.SecurityIdentifier('S-1-5-32-544')
+    $system = New-Object Security.Principal.SecurityIdentifier('S-1-5-18')
+    # 1) забрать владение
+    $k = $rk.OpenSubKey($SubPath, $perm, [Security.AccessControl.RegistryRights]::TakeOwnership)
+    if (-not $k) { throw ('ключ не найден: ' + $SubPath) }
+    $sec = New-Object Security.AccessControl.RegistrySecurity
+    $sec.SetOwner($admins)
+    $k.SetAccessControl($sec)
+    $k.Close()
+    # 2) записать стандартные права
+    $k = $rk.OpenSubKey($SubPath, $perm, [Security.AccessControl.RegistryRights]'ChangePermissions, ReadKey, TakeOwnership')
+    $sec = New-Object Security.AccessControl.RegistrySecurity
+    $sec.SetSecurityDescriptorSddlForm($Sddl, [Security.AccessControl.AccessControlSections]::Access)
+    $k.SetAccessControl($sec)
+    $subs = @($k.GetSubKeyNames())
+    $k.Close()
+    # 3) подразделы
+    foreach ($s in $subs) {
+        try { Reset-HklmKeyAcl ($SubPath + '\' + $s) $Sddl } catch { }
+    }
+    # 4) вернуть владельца SYSTEM
+    try {
+        $k = $rk.OpenSubKey($SubPath, $perm, [Security.AccessControl.RegistryRights]::TakeOwnership)
+        $sec = New-Object Security.AccessControl.RegistrySecurity
+        $sec.SetOwner($system)
+        $k.SetAccessControl($sec)
+        $k.Close()
+    } catch { }
+}
+
+function Unlock-ServiceKey {
+    param([string]$Name)
+    $sub = 'SYSTEM\CurrentControlSet\Services\' + $Name
+    $orig = Get-HklmKeySddl $sub
+    if ($null -eq $orig) { return $false }
+    if (-not (Test-SddlLocked $orig)) { return $true }
+    if ($orig) {
+        try { [IO.File]::WriteAllText((Join-Path (Get-SessionBackupDir) ('sddl_' + $Name + '.txt')), ($sub + "`r`n" + $orig), [Text.Encoding]::UTF8) } catch { }
+    }
+    [void](Enable-Privilege @('SeTakeOwnershipPrivilege', 'SeRestorePrivilege', 'SeBackupPrivilege'))
+    try {
+        Reset-HklmKeyAcl $sub
+    } catch {
+        Write-Log ('Не удалось снять блокировку прав с ключа службы ' + $Name + ': ' + $_.Exception.Message) 'ERROR'
+        return $false
+    }
+    if (Test-HklmKeyLocked $sub) {
+        Write-Log ('Права ключа службы ' + $Name + ' всё ещё заблокированы.') 'ERROR'
+        return $false
+    }
+    Write-Log ('С ключа реестра службы ' + $Name + ' снята блокировка прав (её ставит Windows Update Blocker).') 'OK'
+    return $true
+}
+
 # Текст .reg-файла только с указанными значениями (без подразделов —
 # защищённые подразделы не мешают потом импорту при откате).
 function ConvertTo-RegFileText {
@@ -435,22 +576,36 @@ function Get-HResultFromError {
     param($ErrorRecord)
     $ex = $ErrorRecord
     if ($ErrorRecord -is [Management.Automation.ErrorRecord]) { $ex = $ErrorRecord.Exception }
-    $codes = @()
+    # Сначала — коды из текста сообщения (там настоящая причина, например
+    # «Deployment failed with HRESULT: 0x80073CF3»), затем коды исключений.
+    $msgCodes = @()
+    $excCodes = @()
     $e = $ex
     while ($e) {
-        if ($e -is [Runtime.InteropServices.COMException]) { $codes += $e.ErrorCode }
-        if ($e.HResult -and $e.HResult -ne -2146233087 -and $e.HResult -ne -2146233088) { $codes += $e.HResult }
-        $m = [regex]::Match([string]$e.Message, '0x[0-9A-Fa-f]{8}')
-        if ($m.Success) { $codes += $m.Value }
+        foreach ($m in [regex]::Matches([string]$e.Message, '0x[0-9A-Fa-f]{8}')) { $msgCodes += $m.Value }
+        if ($e -is [Runtime.InteropServices.COMException]) { $excCodes += $e.ErrorCode }
+        if ($e.HResult) { $excCodes += $e.HResult }
         $e = $e.InnerException
     }
-    foreach ($c in $codes) {
+    foreach ($c in @($msgCodes + $excCodes)) {
         $h = Format-HResult $c
-        # общие "обёрточные" коды .NET не информативны
-        if ($h -and $h -notin @('0x80131500', '0x80131509', '0x80004005', '0x80131501')) { return $h }
+        if ($h -and $h -notin $script:GenericHResults) { return $h }
     }
-    if ($codes.Count -gt 0) { return (Format-HResult $codes[0]) }
+    if ($excCodes.Count -gt 0) { return (Format-HResult $excCodes[0]) }
     return $null
+}
+
+# Обёрточные коды .NET/PowerShell — сами по себе ничего не говорят о причине.
+$script:GenericHResults = @('0x80131500', '0x80131501', '0x80131509', '0x80131620', '0x80131600', '0x80131577', '0x80004005', '0x80131515', '0x80131502')
+
+# Первая содержательная строка текста ошибки (для журнала).
+function Get-ErrorText {
+    param($ErrorRecord, [int]$Max = 400)
+    $ex = $ErrorRecord
+    if ($ErrorRecord -is [Management.Automation.ErrorRecord]) { $ex = $ErrorRecord.Exception }
+    $t = ([string]$ex.Message -replace '\s+', ' ').Trim()
+    if ($t.Length -gt $Max) { $t = $t.Substring(0, $Max) + '…' }
+    return $t
 }
 
 function Get-ErrorMessages {

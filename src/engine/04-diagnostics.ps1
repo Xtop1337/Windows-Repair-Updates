@@ -54,6 +54,11 @@ function Get-SystemInfo {
     $ubr = Get-RegValue $cv 'UBR'
     $edition = [string](Get-RegValue $cv 'EditionID')
     $product = [string](Get-RegValue $cv 'ProductName')
+    # Название из WMI совпадает с тем, что показывает winver (в реестре оно бывает устаревшим)
+    try {
+        $cap = [string](Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).Caption
+        if ($cap) { $product = ($cap -replace '^(Майкрософт|Microsoft)\s+', '').Trim() }
+    } catch { }
     if ($build -ge 22000) { $product = $product -replace 'Windows 10', 'Windows 11' }
     $langHex = [string](Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Nls\Language' 'InstallLanguage')
     $lang = $langHex
@@ -182,6 +187,8 @@ function Test-Services {
         if ($s.A -and $obj -and ((ConvertTo-AccountKey $obj) -ne (ConvertTo-AccountKey $s.A))) {
             $problems += ('запускается от чужой учётной записи (' + $obj + ')')
         }
+        $locked = Test-HklmKeyLocked ('SYSTEM\CurrentControlSet\Services\' + $s.N)
+        if ($locked) { $problems += 'права ключа реестра заблокированы (так делает Windows Update Blocker)' }
         $img = [string](Get-RegValue $key 'ImagePath')
         if (-not $img) { $problems += 'не указан файл службы' }
         elseif ($s.Exe -and $img -notmatch [regex]::Escape($s.Exe)) { $problems += ('подменён файл службы (' + $img + ')') }
@@ -194,7 +201,7 @@ function Test-Services {
             }
         }
         if ($problems.Count -eq 0) { continue }
-        if ($isDef -and $thirdAV -and $problems.Count -eq 1 -and $start -eq 4) {
+        if ($isDef -and $thirdAV -and -not $locked -and $problems.Count -eq 1 -and $start -eq 4) {
             $f += New-Finding ('svc-' + $s.N) 'INFO' 'Защитник' ($s.R + ': отключена') 'При стороннем антивирусе Защитник и должен быть выключен — это нормально.' @('Defender')
             continue
         }
@@ -230,7 +237,7 @@ function Test-CriticalFiles {
         if (-not (Test-Path -LiteralPath $p)) { $missing += ($c.P + ' — ' + $c.R) }
     }
     if ($missing.Count -gt 0) {
-        return (New-Finding 'files-missing' 'ERROR' 'Файлы' ('Отсутствуют системные файлы (' + $missing.Count + ')') (($missing -join "`r`n") + "`r`nПопробуйте «Глубокое восстановление»; если не поможет — «Обновить Windows поверх».") @('DISM', 'InPlace'))
+        return (New-Finding 'files-missing' 'ERROR' 'Файлы' ('Отсутствуют системные файлы (' + $missing.Count + ')') (($missing -join "`r`n") + "`r`nПрограмма попробует вернуть их из хранилища компонентов (WinSxS); если не получится — «Обновить Windows поверх».") @('Files', 'DISM', 'InPlace'))
     }
     return (New-Finding 'files-ok' 'OK' 'Файлы' 'Ключевые файлы Центра обновления на месте' '')
 }
@@ -294,6 +301,53 @@ function Test-Policies {
     return $f
 }
 
+# Программы-«блокировщики» обновлений: пока они есть, обновления могут снова отключиться.
+$script:BlockerNamePattern = '(?i)^(wub.*\.exe|wub\.ini|stopupdates10.*\.exe|winupdatestop.*\.exe|win update stop.*\.exe|wumt.*\.exe|windowsupdateblocker.*\.exe)$'
+
+# Быстрый неглубокий поиск файлов по шаблону имени (без объектов PowerShell на каждый файл).
+function Find-FilesShallow {
+    param([string]$Dir, [int]$Depth, [string]$Pattern)
+    $res = @()
+    try { foreach ($f in [IO.Directory]::GetFiles($Dir)) { if ([IO.Path]::GetFileName($f) -match $Pattern) { $res += $f } } } catch { }
+    if ($Depth -gt 0) {
+        try { $subs = [IO.Directory]::GetDirectories($Dir) } catch { $subs = @() }
+        foreach ($d in $subs) {
+            if ($d -match '(?i)\\(Windows|WinSxS|\$Recycle\.Bin|System Volume Information|node_modules|\.git)$') { continue }
+            $res += @(Find-FilesShallow $d ($Depth - 1) $Pattern)
+        }
+    }
+    return $res
+}
+
+function Find-UpdateBlockers {
+    $found = @()
+    $targets = @()
+    foreach ($u in @(Get-ChildItem -LiteralPath (Join-Path $env:SystemDrive 'Users') -Directory -ErrorAction SilentlyContinue)) {
+        foreach ($sub in @('Desktop', 'Downloads', 'Documents', 'OneDrive\Desktop')) {
+            $p = Join-Path $u.FullName $sub
+            if (Test-Path -LiteralPath $p) { $targets += @{ D = $p; N = 2 } }
+        }
+    }
+    foreach ($p in @($env:ProgramFiles, ${env:ProgramFiles(x86)})) {
+        if ($p -and (Test-Path -LiteralPath $p)) { $targets += @{ D = $p; N = 2 } }
+    }
+    $targets += @{ D = ($env:SystemDrive + '\'); N = 1 }
+    foreach ($t in $targets) { $found += @(Find-FilesShallow $t.D $t.N $script:BlockerNamePattern) }
+    foreach ($pr in @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -match '^(Wub|StopUpdates10|wumt)' })) {
+        try { $found += ($pr.Path + ' (запущена)') } catch { $found += ($pr.ProcessName + ' (запущена)') }
+    }
+    return @($found | Select-Object -Unique)
+}
+
+function Test-UpdateBlockers {
+    $b = @(Find-UpdateBlockers)
+    $script:LastBlockers = $b
+    if ($b.Count -eq 0) { return (New-Finding 'blockers-ok' 'OK' 'Блокировки' 'Программ-блокировщиков обновлений не найдено' '') }
+    $text = ($b | Select-Object -First 8) -join "`r`n"
+    return (New-Finding 'blockers' 'WARN' 'Блокировки' ('Найдена программа-блокировщик обновлений (' + $b.Count + ')') ($text + "`r`n`r`nПосле ремонта не запускайте её — она снова отключит обновления. " +
+        'Если это Windows Update Blocker: откройте его, выберите «Включить обновления», снимите галочку «Защитить параметры служб» и нажмите «Применить сейчас». Потом его можно удалить.'))
+}
+
 function Test-Ifeo {
     $f = @()
     $bases = @('HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options')
@@ -336,6 +390,12 @@ function Test-UpdateTasks {
 # ---------------------------------------------------------------------
 #  hosts
 # ---------------------------------------------------------------------
+# «Заглушки» — адреса, которые никуда не ведут: так блокируют сайты через hosts.
+function Test-IsSinkIp {
+    param([string]$Ip)
+    return ([string]$Ip -match '^(0\.0\.0\.0|127\.\d{1,3}\.\d{1,3}\.\d{1,3}|255\.255\.255\.255|::1?|0:0:0:0:0:0:0:[01]|0+\.0+\.0+\.0+)$')
+}
+
 function Test-IsProtectedHost {
     param([string]$HostName)
     $h = ([string]$HostName).Trim().TrimEnd('.').ToLowerInvariant()
@@ -357,6 +417,7 @@ function Get-HostsBlockEntries {
         if (-not $content) { continue }
         $tokens = @($content -split '\s+' | Where-Object { $_ })
         if ($tokens.Count -lt 2) { continue }
+        if (-not (Test-IsSinkIp $tokens[0])) { continue }   # настоящий IP — это не блокировка
         $names = @($tokens[1..($tokens.Count - 1)])
         $hit = @($names | Where-Object { Test-IsProtectedHost $_ })
         if ($hit.Count -gt 0) {
@@ -407,9 +468,23 @@ function Test-HostsFile {
         $sample = @($bad | Select-Object -First 15 | ForEach-Object { $_.Line.Trim() })
         $more = ''
         if ($bad.Count -gt 15) { $more = "`r`n… и ещё " + ($bad.Count - 15) }
-        return (New-Finding 'hosts' 'ERROR' 'Сеть' ('В файле hosts заблокированы серверы Microsoft (' + $bad.Count + ' строк)') (($sample -join "`r`n") + $more + "`r`nЧисто «шпионские» адреса (телеметрия) останутся заблокированными.") @('Hosts'))
+        return (New-Finding 'hosts' 'ERROR' 'Сеть' ('В файле hosts заблокированы нужные серверы (' + $bad.Count + ' строк)') (($sample -join "`r`n") + $more + "`r`nЧисто «шпионские» адреса (телеметрия) останутся заблокированными.") @('Hosts'))
     }
-    return (New-Finding 'hosts-ok' 'OK' 'Сеть' 'Файл hosts не блокирует серверы Microsoft' '')
+    # Закреплённые настоящие адреса (например, чтобы открывался GitHub) не трогаем —
+    # только сообщаем, если среди них есть серверы Центра обновления.
+    $pinned = @()
+    foreach ($l in $data.Lines) {
+        $c = ([string]$l -split '#', 2)[0].Trim()
+        $t = @($c -split '\s+' | Where-Object { $_ })
+        if ($t.Count -lt 2 -or (Test-IsSinkIp $t[0])) { continue }
+        foreach ($h in $t[1..($t.Count - 1)]) {
+            if ($h -match '(?i)(windowsupdate\.com|update\.microsoft\.com|delivery\.mp\.microsoft\.com)$') { $pinned += ($t[0] + ' ' + $h) }
+        }
+    }
+    if ($pinned.Count -gt 0) {
+        return (New-Finding 'hosts-pinned' 'INFO' 'Сеть' ('В hosts вручную закреплены адреса серверов обновления (' + $pinned.Count + ')') (($pinned -join "`r`n") + "`r`nЕсли обновления не скачиваются, эти строки могут устареть — их можно удалить вручную."))
+    }
+    return (New-Finding 'hosts-ok' 'OK' 'Сеть' 'Файл hosts не блокирует нужные серверы' '')
 }
 
 # ---------------------------------------------------------------------
@@ -516,11 +591,38 @@ function Get-WinHttpProxy {
     return (ConvertFrom-WinHttpSettings $bin)
 }
 
+# «127.0.0.1:10809» или «http=host:port;https=host:port» → адрес и порт первого прокси
+function Get-ProxyEndpoint {
+    param([string]$Proxy)
+    if (-not $Proxy) { return $null }
+    $first = ($Proxy -split ';')[0]
+    $first = ($first -replace '^[a-z]+=', '') -replace '^[a-z]+://', ''
+    $m = [regex]::Match($first, '^\[?([^\]\s]+?)\]?:(\d{1,5})$')
+    if (-not $m.Success) { return $null }
+    return [pscustomobject]@{ Host = $m.Groups[1].Value; Port = [int]$m.Groups[2].Value }
+}
+
+function Test-ProxyAlive {
+    $p = Get-WinHttpProxy
+    if (-not $p.Proxy) { return $null }
+    $ep = Get-ProxyEndpoint $p.Proxy
+    if (-not $ep) { return [pscustomobject]@{ Proxy = $p.Proxy; Alive = $true; Local = $false } }
+    $r = Test-TcpEndpoint $ep.Host $ep.Port 2500 -AllowLoopback
+    return [pscustomobject]@{ Proxy = $p.Proxy; Alive = [bool]$r.Ok; Local = ($ep.Host -match '^(127\.|localhost$|::1$)') }
+}
+
 function Test-Proxy {
     $f = @()
-    $p = Get-WinHttpProxy
-    if ($p.Proxy) {
-        $f += New-Finding 'proxy-winhttp' 'WARN' 'Сеть' ('Задан системный прокси WinHTTP: ' + $p.Proxy) 'Через него Центр обновления выходит в интернет. Если прокси не работает — обновления не скачиваются. Сбросится, только если серверы Microsoft недоступны.' @('Proxy')
+    $st = Test-ProxyAlive
+    $script:LastProxyState = $st
+    if ($st) {
+        $who = 'прокси'
+        if ($st.Local) { $who = 'VPN-программу (локальный прокси)' }
+        if ($st.Alive) {
+            $f += New-Finding 'proxy-winhttp' 'INFO' 'Сеть' ('Центр обновления выходит в интернет через ' + $who + ' ' + $st.Proxy + ' — сейчас он отвечает') 'Не выключайте VPN, пока идут обновления: без него Центр обновления не сможет ничего скачать.'
+        } else {
+            $f += New-Finding 'proxy-dead' 'ERROR' 'Сеть' ('Центр обновления настроен ходить через ' + $who + ' ' + $st.Proxy + ', но он не отвечает') 'Скорее всего, VPN-программа выключена. Включите VPN — или сбросьте прокси, чтобы обновления шли напрямую.' @('Proxy')
+        }
     }
     $is = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
     if ((Get-RegValue $is 'ProxyEnable') -eq 1) {
@@ -569,7 +671,7 @@ function Test-SystemTime {
 }
 
 function Test-TcpEndpoint {
-    param([string]$HostName, [int]$Port, [int]$TimeoutMs = 3500)
+    param([string]$HostName, [int]$Port, [int]$TimeoutMs = 3500, [switch]$AllowLoopback)
     $r = [pscustomobject]@{ Host = $HostName; Port = $Port; Resolved = ''; Ok = $false; Error = $null; Blocked = $false }
     $ips = $null
     try { $ips = [Net.Dns]::GetHostAddresses($HostName) } catch {
@@ -578,7 +680,7 @@ function Test-TcpEndpoint {
     }
     $r.Resolved = (@($ips | ForEach-Object { $_.IPAddressToString }) -join ', ')
     $sink = @($ips | Where-Object { $_.IPAddressToString -in @('0.0.0.0', '127.0.0.1', '::1', '::') })
-    if ($sink.Count -gt 0) {
+    if ($sink.Count -gt 0 -and -not $AllowLoopback) {
         $r.Error = 'адрес подменён на ' + $sink[0].IPAddressToString + ' (блокировка через hosts/DNS)'
         $r.Blocked = $true
         return $r
@@ -657,12 +759,13 @@ function Get-EventErrorSummary {
         }
         foreach ($c in $codes) {
             if ($CodeFilter -and $c -notmatch $CodeFilter) { continue }
-            if (-not $map.ContainsKey($c)) { $map[$c] = [pscustomobject]@{ Code = $c; Count = 0; Last = $e.TimeCreated; Kbs = @(); Claude = $false } }
+            if (-not $map.ContainsKey($c)) { $map[$c] = [pscustomobject]@{ Code = $c; Count = 0; Last = $e.TimeCreated; Kbs = @(); Claude = $false; Sample = '' } }
             $entry = $map[$c]
             $entry.Count++
             if ($e.TimeCreated -gt $entry.Last) { $entry.Last = $e.TimeCreated }
             foreach ($m in [regex]::Matches($msg, 'KB\d{6,7}')) { if ($entry.Kbs -notcontains $m.Value) { $entry.Kbs += $m.Value } }
             if ($msg -match '(?i)claude') { $entry.Claude = $true }
+            if ($e.TimeCreated -ge $entry.Last -or -not $entry.Sample) { $entry.Sample = (($msg -replace '\s+', ' ').Trim()) }
         }
     }
     return @($map.Values | Sort-Object Last -Descending)
@@ -715,7 +818,9 @@ function Test-AppxEventLog {
         $info = Get-ErrorInfo $s.Code
         $who = 'приложения'
         if ($s.Claude) { $who = 'Claude Desktop' }
-        $f += New-Finding ('evt-appx-' + $s.Code) 'WARN' 'Магазин/MSIX' ('Ошибка установки ' + $who + ': ' + $s.Code + ' (' + $s.Count + ' раз)') ($info.Text + ' Что поможет: ' + (Format-FixList $info.Fix) + '.') $info.Fix
+        $sample = [string]$s.Sample
+        if ($sample.Length -gt 350) { $sample = $sample.Substring(0, 350) + '…' }
+        $f += New-Finding ('evt-appx-' + $s.Code) 'WARN' 'Магазин/MSIX' ('Ошибка установки ' + $who + ': ' + $s.Code + ' (' + $s.Count + ' раз)') ($info.Text + ' Что поможет: ' + (Format-FixList $info.Fix) + '.' + "`r`nПоследнее сообщение: " + $sample) $info.Fix
     }
     return $f
 }
@@ -924,6 +1029,7 @@ function Invoke-Diagnostics {
         @{ N = 'урезанная сборка';               S = { Test-TrimmedBuild } }
         @{ N = 'политики';                       S = { Test-Policies } }
         @{ N = 'блокировка запуска программ';    S = { Test-Ifeo } }
+        @{ N = 'программы-блокировщики';         S = { Test-UpdateBlockers } }
         @{ N = 'задания планировщика';           S = { Test-UpdateTasks } }
         @{ N = 'файл hosts';                     S = { Test-HostsFile } }
         @{ N = 'сетевые маршруты';               S = { Test-PersistentRoutes } }

@@ -281,6 +281,58 @@ Describe 'Брандмауэр и резервные копии' {
     }
 }
 
+Describe 'Находки из реального отчёта (v1.0.7)' {
+    It 'hosts: настоящие IP (например, для GitHub) — не блокировка' {
+        $lines = @(
+            '185.199.109.133 objects.githubusercontent.com',
+            '185.199.108.133 raw.githubusercontent.com',
+            '0.0.0.0 update.microsoft.com',
+            '127.0.0.1 dl.delivery.mp.microsoft.com',
+            '13.107.4.50 download.windowsupdate.com'
+        )
+        $bad = @(Get-HostsBlockEntries -Lines $lines)
+        $bad.Count | Should -Be 2
+        ($bad | ForEach-Object { $_.Hosts[0] }) | Should -Be @('update.microsoft.com', 'dl.delivery.mp.microsoft.com')
+    }
+    It 'Test-IsSinkIp' {
+        foreach ($ip in @('0.0.0.0', '127.0.0.1', '127.1.2.3', '::1', '::', '255.255.255.255')) { Test-IsSinkIp $ip | Should -BeTrue -Because $ip }
+        foreach ($ip in @('185.199.108.133', '10.0.0.1', '192.168.1.1', '8.8.8.8')) { Test-IsSinkIp $ip | Should -BeFalse -Because $ip }
+    }
+    It 'Get-ProxyEndpoint разбирает разные записи прокси' {
+        $e = Get-ProxyEndpoint '127.0.0.1:10809'
+        $e.Host | Should -Be '127.0.0.1'; $e.Port | Should -Be 10809
+        (Get-ProxyEndpoint 'http=proxy.local:3128;https=proxy.local:3129').Port | Should -Be 3128
+        (Get-ProxyEndpoint 'http://10.0.0.5:8080').Host | Should -Be '10.0.0.5'
+        Get-ProxyEndpoint '' | Should -BeNullOrEmpty
+    }
+    It 'живой локальный VPN-прокси считается доступным' {
+        $l = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback, 0)
+        $l.Start()
+        try {
+            $port = $l.LocalEndpoint.Port
+            (Test-TcpEndpoint '127.0.0.1' $port 2000 -AllowLoopback).Ok | Should -BeTrue
+            (Test-TcpEndpoint '127.0.0.1' $port 2000).Blocked | Should -BeTrue
+        } finally { $l.Stop() }
+    }
+    It 'Get-HResultFromError берёт код из текста, а не обёрточный 0x80131620' {
+        $inner = New-Object IO.IOException('Сбой развертывания с HRESULT: 0x80073CF3, Пакет не прошел проверку обновления, зависимости или конфликта.')
+        $rec = New-Object Management.Automation.ErrorRecord($inner, 'x', 'NotSpecified', $null)
+        Get-HResultFromError $rec | Should -Be '0x80073CF3'
+        $plain = New-Object IO.IOException('без кода')
+        Get-HResultFromError (New-Object Management.Automation.ErrorRecord($plain, 'x', 'NotSpecified', $null)) | Should -Be '0x80131620'
+    }
+    It 'Test-SddlLocked: обычный ключ службы не заблокирован' {
+        Test-SddlLocked 'O:SYG:SYD:AI(A;ID;KA;;;BA)(A;CIIOID;GA;;;BA)(A;ID;KA;;;SY)(A;CIIOID;GA;;;SY)(A;ID;KR;;;BU)' | Should -BeFalse
+        Test-SddlLocked $script:ServiceKeySddl | Should -BeFalse
+    }
+    It 'Test-SddlLocked: запрет записи или нет прав у SYSTEM — заблокирован' {
+        Test-SddlLocked 'O:SYD:P(D;;KW;;;SY)(D;;KW;;;BA)(A;;KR;;;SY)(A;;KR;;;BA)' | Should -BeTrue
+        Test-SddlLocked 'O:SYD:P(A;;KR;;;SY)(A;;KR;;;BA)(A;;KR;;;BU)' | Should -BeTrue
+        Test-SddlLocked '' | Should -BeTrue
+        Test-SddlLocked $null | Should -BeFalse
+    }
+}
+
 Describe 'Исходники' {
     BeforeAll {
         $root = Split-Path -Parent $PSScriptRoot

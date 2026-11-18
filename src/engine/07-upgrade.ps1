@@ -162,8 +162,43 @@ function Export-Report {
         [void]$sb.AppendLine('ПОСЛЕДНИЙ РЕМОНТ')
         [void]$sb.AppendLine('----------------------------------------------------------')
         [void]$sb.AppendLine('Исправлено: ' + ($script:RepairSummary.Done -join ', '))
+        [void]$sb.AppendLine('Проверено, менять не понадобилось: ' + ($script:RepairSummary.Checked -join ', '))
+        [void]$sb.AppendLine('Пропущено по выбору: ' + ($script:RepairSummary.Skipped -join ', '))
         [void]$sb.AppendLine('Не получилось: ' + ($script:RepairSummary.Failed -join ', '))
     }
+    [void]$sb.AppendLine('')
+    [void]$sb.AppendLine('СЛУЖБЫ (тип запуска / состояние / учётная запись / права ключа)')
+    [void]$sb.AppendLine('----------------------------------------------------------')
+    foreach ($s in $script:ServiceTable) {
+        $key = 'HKLM:\SYSTEM\CurrentControlSet\Services\' + $s.N
+        if (-not (Test-Path -LiteralPath $key)) { [void]$sb.AppendLine(('{0,-22} УДАЛЕНА' -f $s.N)); continue }
+        $st = '?'
+        try { $st = [string](Get-Service -Name $s.N -ErrorAction Stop).Status } catch { }
+        $lock = 'норма'
+        if (Test-HklmKeyLocked ('SYSTEM\CurrentControlSet\Services\' + $s.N)) { $lock = 'ЗАБЛОКИРОВАНЫ' }
+        [void]$sb.AppendLine(('{0,-22} {1,-28} {2,-8} {3,-28} права: {4}' -f $s.N, (Get-StartTypeName ([int](Get-RegValue $key 'Start')) ((Get-RegValue $key 'DelayedAutostart') -eq 1)), $st, [string](Get-RegValue $key 'ObjectName'), $lock))
+    }
+    try {
+        $px = Test-ProxyAlive
+        [void]$sb.AppendLine('')
+        if ($px) { [void]$sb.AppendLine('Прокси WinHTTP: ' + $px.Proxy + ' — ' + $(if ($px.Alive) { 'отвечает' } else { 'НЕ отвечает' })) }
+        else { [void]$sb.AppendLine('Прокси WinHTTP: не задан') }
+    } catch { }
+    if ($script:LastBlockers -and @($script:LastBlockers).Count -gt 0) {
+        [void]$sb.AppendLine('Найдены блокировщики обновлений: ' + (@($script:LastBlockers) -join '; '))
+    }
+    [void]$sb.AppendLine('')
+    [void]$sb.AppendLine('ПОСЛЕДНИЕ ОШИБКИ УСТАНОВКИ ПРИЛОЖЕНИЙ (AppX/MSIX)')
+    [void]$sb.AppendLine('----------------------------------------------------------')
+    try {
+        $ev = @(Get-WinEventSafe @{ LogName = 'Microsoft-Windows-AppXDeploymentServer/Operational'; Level = 2; StartTime = (Get-Date).AddDays(-7) } 8)
+        if ($ev.Count -eq 0) { [void]$sb.AppendLine('(нет за последние 7 дней)') }
+        foreach ($e in $ev) {
+            $m = (([string]$e.Message) -replace '\s+', ' ').Trim()
+            if ($m.Length -gt 500) { $m = $m.Substring(0, 500) + '…' }
+            [void]$sb.AppendLine($e.TimeCreated.ToString('dd.MM HH:mm') + '  [' + $e.Id + '] ' + $m)
+        }
+    } catch { [void]$sb.AppendLine('(журнал недоступен: ' + $_.Exception.Message + ')') }
     [void]$sb.AppendLine('')
     [void]$sb.AppendLine('ЖУРНАЛ (последние строки)')
     [void]$sb.AppendLine('----------------------------------------------------------')
@@ -244,6 +279,17 @@ function Restore-FromBackup {
             $r = Invoke-Proc 'sc.exe' ('sdset ' + $svc + ' ' + $val) -TimeoutSec 30 -Quiet
             if ($r.ExitCode -eq 0) { Write-Log ('Права службы ' + $svc + ' восстановлены.') 'OK' }
         }
+    }
+    # исходные права ключей служб — в самом конце (после импорта значений)
+    foreach ($sf in @($files | Where-Object { $_.Name -like 'sddl_*.txt' })) {
+        try {
+            $lines = [IO.File]::ReadAllLines($sf.FullName, [Text.Encoding]::UTF8)
+            if ($lines.Count -ge 2 -and $lines[1]) {
+                [void](Enable-Privilege @('SeTakeOwnershipPrivilege', 'SeRestorePrivilege', 'SeBackupPrivilege'))
+                Reset-HklmKeyAcl $lines[0].Trim() $lines[1].Trim()
+                Write-Log ('Права ключа восстановлены: ' + $lines[0].Trim()) 'OK'
+            }
+        } catch { $ok = $false; Write-Log ('Не удалось восстановить права из ' + $sf.Name + ': ' + $_.Exception.Message) 'WARN' }
     }
     [void](Invoke-Proc 'ipconfig.exe' '/flushdns' -TimeoutSec 30 -Quiet)
     Write-Log 'Откат завершён. Перезагрузите компьютер, чтобы все изменения вступили в силу.' 'STEP'
