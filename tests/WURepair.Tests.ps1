@@ -172,6 +172,40 @@ Describe 'Прочее' {
     }
 }
 
+Describe 'Журналы и рекомендации' {
+    It 'Get-EventErrorSummary группирует коды и находит KB' {
+        $now = Get-Date
+        $ev = @(
+            [pscustomobject]@{ Message = 'Сбой установки: 0x80070643 обновление KB5034441'; TimeCreated = $now.AddDays(-1); Properties = @() },
+            [pscustomobject]@{ Message = 'Сбой установки: 0x80070643 обновление KB5034441'; TimeCreated = $now; Properties = @() },
+            [pscustomobject]@{ Message = 'Windows Update failed to check for updates with error 0x80072EFD.'; TimeCreated = $now.AddDays(-3); Properties = @() },
+            [pscustomobject]@{ Message = 'без кода'; TimeCreated = $now; Properties = @([pscustomobject]@{ Value = [int](-2147024894) }) }
+        )
+        $s = @(Get-EventErrorSummary -Events $ev)
+        $s.Count | Should -Be 3
+        $first = @($s | Where-Object { $_.Code -eq '0x80070643' })[0]
+        $first.Count | Should -Be 2
+        $first.Kbs | Should -Contain 'KB5034441'
+        @($s | Where-Object { $_.Code -eq '0x80070002' }).Count | Should -Be 1
+    }
+    It 'Get-EventErrorSummary фильтрует по шаблону' {
+        $ev = @([pscustomobject]@{ Message = '0x80073CFF и 0x80070005 Claude'; TimeCreated = (Get-Date); Properties = @() })
+        $s = @(Get-EventErrorSummary -Events $ev -CodeFilter '^0x80073[CD]')
+        $s.Count | Should -Be 1
+        $s[0].Claude | Should -BeTrue
+    }
+    It 'Get-RecommendedFixes берёт исправления только из ошибок и предупреждений' {
+        $f = @(
+            (New-Finding 'a' 'ERROR' 'x' 't' '' @('Hosts', 'Proxy') -NoUi),
+            (New-Finding 'b' 'WARN' 'x' 't' '' @('Hosts', 'Time') -NoUi),
+            (New-Finding 'c' 'INFO' 'x' 't' '' @('DISM') -NoUi),
+            (New-Finding 'd' 'OK' 'x' 't' '' @() -NoUi)
+        )
+        $r = @(Get-RecommendedFixes $f)
+        $r | Should -Be @('Hosts', 'Proxy', 'Time')
+    }
+}
+
 Describe 'Исходники' {
     BeforeAll {
         $root = Split-Path -Parent $PSScriptRoot
