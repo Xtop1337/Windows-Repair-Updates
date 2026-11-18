@@ -27,3 +27,15 @@ if (-not $p.WaitForExit($TimeoutSec * 1000)) {
 Write-Host ('Код выхода: ' + $p.ExitCode)
 if (-not (Test-Path -LiteralPath $Out)) { throw 'Скриншот не создан — окно не дошло до конца диагностики.' }
 Write-Host ('Скриншот: ' + $Out + ' (' + (Get-Item $Out).Length + ' байт)')
+$layout = [IO.Path]::ChangeExtension($Out, '.layout.txt')
+if (Test-Path -LiteralPath $layout) {
+    Write-Host '===== РАСКЛАДКА ОКНА ====='
+    Get-Content -LiteralPath $layout -Encoding UTF8 | ForEach-Object { Write-Host $_ }
+}
+$jpg = [IO.Path]::ChangeExtension($Out, '.small.jpg')
+if (Test-Path -LiteralPath $jpg) {
+    $b64 = [Convert]::ToBase64String([IO.File]::ReadAllBytes($jpg))
+    Write-Host ('===== JPEG-BASE64-BEGIN ' + [IO.Path]::GetFileName($Out) + ' ' + $b64.Length + ' =====')
+    for ($i = 0; $i -lt $b64.Length; $i += 4000) { Write-Host ('B64:' + $b64.Substring($i, [Math]::Min(4000, $b64.Length - $i))) }
+    Write-Host '===== JPEG-BASE64-END ====='
+}

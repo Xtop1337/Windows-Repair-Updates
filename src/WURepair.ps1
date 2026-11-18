@@ -653,6 +653,51 @@ function Save-Screenshot {
     $form.DrawToBitmap($bmp2, (New-Object Drawing.Rectangle(0, 0, $form.Width, $form.Height)))
     $bmp2.Save($alt, [Drawing.Imaging.ImageFormat]::Png)
     $bmp2.Dispose()
+    # уменьшенная копия (для журнала CI)
+    $src = [Drawing.Image]::FromFile($Path)
+    $w = 760
+    $h = [int]($src.Height * $w / $src.Width)
+    $small = New-Object Drawing.Bitmap($w, $h)
+    $gs = [Drawing.Graphics]::FromImage($small)
+    $gs.InterpolationMode = [Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+    $gs.DrawImage($src, 0, 0, $w, $h)
+    $gs.Dispose()
+    $src.Dispose()
+    $codec = [Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() | Where-Object { $_.MimeType -eq 'image/jpeg' }
+    $ep = New-Object Drawing.Imaging.EncoderParameters(1)
+    $ep.Param[0] = New-Object Drawing.Imaging.EncoderParameter([Drawing.Imaging.Encoder]::Quality, [long]55)
+    $small.Save([IO.Path]::ChangeExtension($Path, '.small.jpg'), $codec, $ep)
+    $small.Dispose()
+    [IO.File]::WriteAllText([IO.Path]::ChangeExtension($Path, '.layout.txt'), (Get-LayoutReport), [Text.Encoding]::UTF8)
+}
+
+# Отчёт о раскладке окна: размеры элементов и проверка, не обрезан ли текст.
+function Get-LayoutReport {
+    $sb = New-Object Text.StringBuilder
+    $g = $form.CreateGraphics()
+    [void]$sb.AppendLine(('Форма: {0}x{1}, клиентская область {2}x{3}, DPI {4}' -f $form.Width, $form.Height, $form.ClientSize.Width, $form.ClientSize.Height, $g.DpiX))
+    $g.Dispose()
+    $clipped = 0
+    $walk = $null
+    $walk = {
+        param($c, [int]$depth)
+        $line = ('{0}{1} "{2}" {3}x{4} @({5},{6}) visible={7}' -f ('  ' * $depth), $c.GetType().Name, ([string]$c.Text -replace "\r?\n", ' '), $c.Width, $c.Height, $c.Left, $c.Top, $c.Visible)
+        if (($c -is [Windows.Forms.Button] -or $c -is [Windows.Forms.Label]) -and $c.Text -and -not $c.AutoSize) {
+            $avail = $c.ClientSize.Width - $c.Padding.Horizontal - 8
+            $need = [Windows.Forms.TextRenderer]::MeasureText([string]$c.Text, $c.Font).Width
+            if ($need -gt $avail -and $c.Width -gt 0) { $line += ('   <<< ОБРЕЗАНО: нужно ' + $need + ' px, есть ' + $avail); $script:LayoutClipped++ }
+        }
+        [void]$sb.AppendLine($line)
+        foreach ($ch in $c.Controls) { & $walk $ch ($depth + 1) }
+    }
+    $script:LayoutClipped = 0
+    foreach ($c in $form.Controls) { & $walk $c 1 }
+    [void]$sb.AppendLine(('Строк в списке проблем: {0}' -f $lv.Items.Count))
+    foreach ($it in $lv.Items) { [void]$sb.AppendLine(('  [{0}] {1}: {2}' -f $it.Text, $it.SubItems[1].Text, $it.SubItems[2].Text)) }
+    [void]$sb.AppendLine(('Обрезанных надписей: {0}' -f $script:LayoutClipped))
+    [void]$sb.AppendLine('--- журнал в окне (последние строки) ---')
+    foreach ($l in @($log.Lines | Select-Object -Last 25)) { [void]$sb.AppendLine($l) }
+    return $sb.ToString()
 }
 
 function Start-SmokeTest {
