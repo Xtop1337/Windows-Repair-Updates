@@ -89,7 +89,7 @@ function Format-SystemInfo {
     if (-not $av) { $av = 'не обнаружен' }
     $ubr = ''
     if ($null -ne $Info.UBR) { $ubr = '.' + $Info.UBR }
-    return ('{0} ({1}), версия {2}, сборка {3}{4}, {5}, язык {6} | Свободно на {7}: {8} ГБ | ОЗУ: {9} ГБ | Антивирус: {10}' -f `
+    return ('{0} ({1}), версия {2}, сборка {3}{4}, {5}, язык {6}  •  Диск {7} свободно {8} ГБ  •  ОЗУ {9} ГБ  •  Антивирус: {10}' -f `
             $Info.ProductName, $Info.EditionID, $Info.Version, $Info.Build, $ubr, $Info.Arch, $Info.Language, $env:SystemDrive, $Info.FreeGB, $Info.RamGB, $av)
 }
 

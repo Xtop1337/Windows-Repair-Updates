@@ -110,7 +110,8 @@ $fontBig = New-Object Drawing.Font('Segoe UI', 10, [Drawing.FontStyle]::Bold)
 $form = New-Object Windows.Forms.Form
 $form.Text = 'WURepair — ремонт Центра обновления Windows 10  (v' + $script:AppVersion + ')'
 $form.StartPosition = 'CenterScreen'
-$form.Size = New-Object Drawing.Size(1180, 760)
+$wa = [Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+$form.Size = New-Object Drawing.Size([Math]::Min(1180, $wa.Width - 10), [Math]::Min(780, $wa.Height - 10))
 $form.MinimumSize = New-Object Drawing.Size(940, 600)
 $form.Font = $fontMain
 $form.Icon = [Drawing.SystemIcons]::Shield
@@ -177,7 +178,7 @@ $split.Panel2.Controls.Add($logTitle)
 # --- левая панель с кнопками ---
 $left = New-Object Windows.Forms.FlowLayoutPanel
 $left.Dock = 'Left'
-$left.Width = 300
+$left.Width = 322
 $left.FlowDirection = 'TopDown'
 $left.WrapContents = $false
 $left.AutoScroll = $true
@@ -189,7 +190,7 @@ function Add-SectionLabel {
     $l = New-Object Windows.Forms.Label
     $l.Text = $Text
     $l.AutoSize = $false
-    $l.Width = 268
+    $l.Width = 286
     $l.Height = 26
     $l.TextAlign = 'BottomLeft'
     $l.Font = $fontBold
@@ -202,7 +203,7 @@ function Add-ActionButton {
     param([string]$Text, [string]$Tip, [scriptblock]$OnClick, [switch]$Primary)
     $b = New-Object Windows.Forms.Button
     $b.Text = $Text
-    $b.Width = 268
+    $b.Width = 286
     $b.TextAlign = 'MiddleLeft'
     $b.Padding = New-Object Windows.Forms.Padding(8, 0, 0, 0)
     $b.Margin = New-Object Windows.Forms.Padding(0, 0, 0, 6)
@@ -228,7 +229,7 @@ function Add-ActionButton {
 # --- шапка ---
 $header = New-Object Windows.Forms.Panel
 $header.Dock = 'Top'
-$header.Height = 78
+$header.Height = 84
 $header.BackColor = $colorHeader
 $hTitle = New-Object Windows.Forms.Label
 $hTitle.Text = 'Ремонт Центра обновления Windows 10'
@@ -241,8 +242,9 @@ $hInfo = New-Object Windows.Forms.Label
 $hInfo.Text = 'Определяю версию Windows…'
 $hInfo.ForeColor = [Drawing.Color]::FromArgb(205, 215, 235)
 $hInfo.AutoSize = $false
+$hInfo.AutoEllipsis = $true
 $hInfo.Location = New-Object Drawing.Point(16, 44)
-$hInfo.Size = New-Object Drawing.Size(1140, 30)
+$hInfo.Size = New-Object Drawing.Size(($form.ClientSize.Width - 24), 38)
 $hInfo.Anchor = 'Top, Left, Right'
 $header.Controls.Add($hInfo)
 
