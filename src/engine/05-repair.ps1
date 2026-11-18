@@ -34,17 +34,18 @@ function Repair-ServiceEntry {
     }
     $ok = $true
     $touched = $false
+    # Сначала снимаем блокировку прав: пока ключ заперт, его значения
+    # нельзя изменить (а иногда и прочитать) даже от имени SYSTEM.
+    if (Test-HklmKeyLocked ('SYSTEM\CurrentControlSet\Services\' + $name)) {
+        if (-not (Unlock-ServiceKey $name)) { $ok = $false }
+        $touched = $true
+    }
     $start = Get-RegValue $key 'Start'
     $obj = [string](Get-RegValue $key 'ObjectName')
     $img = [string](Get-RegValue $key 'ImagePath')
     $needAcc = ($Entry.A -and $obj -and ((ConvertTo-AccountKey $obj) -ne (ConvertTo-AccountKey $Entry.A)))
     $needImg = ($Entry.Img -and $Entry.Exe -and ((-not $img) -or ($img -notmatch [regex]::Escape($Entry.Exe))))
-    $locked = Test-HklmKeyLocked ('SYSTEM\CurrentControlSet\Services\' + $name)
-    if ($start -ne 4 -and -not $needAcc -and -not $needImg -and -not $locked) { return $true }
-    if ($locked) {
-        # Сначала снимаем блокировку прав, иначе ключ не изменить даже от имени SYSTEM
-        if (-not (Unlock-ServiceKey $name)) { $ok = $false }
-    }
+    if ($start -ne 4 -and -not $needAcc -and -not $needImg -and -not $touched) { return $true }
     [void](Backup-RegKey $key ('svc_' + $name))
 
     if ($start -eq 4) {
@@ -652,6 +653,7 @@ function Find-WinSxSFile {
 
 function Repair-MissingFiles {
     Write-Log 'Возвращаю удалённые системные файлы из хранилища компонентов (WinSxS)…' 'STEP'
+    Set-UiStatus 'Поиск копий удалённых файлов в WinSxS (1–2 минуты)…'
     $info = $script:LastSysInfo
     if (-not $info) { $info = Get-SystemInfo }
     $ok = $true

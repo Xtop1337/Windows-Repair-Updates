@@ -53,7 +53,8 @@ Stop-Service wuauserv -Force -ErrorAction SilentlyContinue
 
 # Как Windows Update Blocker: запрет записи в ключ службы даже для SYSTEM
 [void](Enable-Privilege @('SeTakeOwnershipPrivilege', 'SeRestorePrivilege', 'SeBackupPrivilege'))
-Reset-HklmKeyAcl 'SYSTEM\CurrentControlSet\Services\wuauserv' 'D:P(D;;KW;;;SY)(D;;KW;;;BA)(A;;KR;;;SY)(A;;KR;;;BA)(A;;KR;;;BU)'
+# (читать можно, записывать нельзя никому — как в реальном отчёте с Wub)
+Reset-HklmKeyAcl 'SYSTEM\CurrentControlSet\Services\wuauserv' 'D:P(D;;0x6;;;SY)(D;;0x6;;;BA)(A;;KR;;;SY)(A;;KR;;;BA)(A;;KR;;;BU)'
 $scTry = & sc.exe config wuauserv start= demand 2>&1 | Out-String
 Write-Host ('Попытка включить заблокированную службу: ' + $scTry.Trim())
 Assert-That (Test-HklmKeyLocked 'SYSTEM\CurrentControlSet\Services\wuauserv') 'ключ wuauserv заблокирован как у Windows Update Blocker'
