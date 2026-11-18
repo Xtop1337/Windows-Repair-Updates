@@ -395,7 +395,7 @@ function Invoke-UiEvent {
         }
         'finding'       { Add-FindingRow $d }
         'clearfindings' { $lv.Items.Clear() }
-        'sysinfo'       { $hInfo.Text = (Format-SystemInfo $d) }
+        'sysinfo'       { $hInfo.Text = ((Format-SystemInfo $d) -replace '\s+•\s+Диск', "`r`nДиск") }
         'message'       { Show-Message $d.Text $d.Title $d.Icon }
         'ask'           {
             $res = [Windows.Forms.MessageBox]::Show($form, [string]$d.Text, [string]$d.Title, [Windows.Forms.MessageBoxButtons]::YesNo, [Windows.Forms.MessageBoxIcon]::Question)
