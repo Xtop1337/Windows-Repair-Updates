@@ -186,7 +186,7 @@ function Invoke-Proc {
                         $pos += $read
                         $chars = New-Object char[] ($enc.GetMaxCharCount($read))
                         $n = $decoder.GetChars($buf, 0, $read, $chars, 0)
-                        $text = New-Object string($chars, 0, $n)
+                        $text = [string]::new($chars, 0, $n)
                         [void]$sb.Append($text)
                         if ($LiveLog) {
                             $pending += $text
@@ -497,7 +497,11 @@ function Invoke-Download {
         try { if (-not $status -and $_.Exception.Response) { $status = [int]$_.Exception.Response.StatusCode } } catch { }
         Write-Log ('Ошибка загрузки ' + $What + ': ' + $msg) 'ERROR'
         if ($status -eq 403 -or $status -eq 451) {
-            Write-Log 'Сервер отказал в загрузке. Возможно, сайт недоступен в вашей стране или сети (попробуйте другую сеть/VPN).' 'WARN'
+            if ($Url -match '(?i)claude\.ai|anthropic\.com') {
+                Write-Log 'Сервер claude.ai отказал в загрузке. Claude доступен не во всех странах — список: https://www.anthropic.com/supported-countries' 'WARN'
+            } else {
+                Write-Log 'Сервер отказал в загрузке. Возможно, загрузка недоступна из вашей сети — попробуйте позже или из другой сети.' 'WARN'
+            }
         } elseif ($msg -match '(?i)trust|SSL|TLS|сертификат|безопасн') {
             Write-Log 'Ошибка защищённого соединения. Частые причины: неверные дата/время на компьютере или антивирус, проверяющий HTTPS.' 'WARN'
         }
@@ -598,16 +602,18 @@ function Invoke-AsSystem {
         $pr = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
         Register-ScheduledTask -TaskName $name -Action $act -Principal $pr -Force -ErrorAction Stop | Out-Null
         Start-ScheduledTask -TaskName $name -ErrorAction Stop
-        Start-Sleep -Milliseconds 800
+        # 0x41301 = выполняется, 0x41303 = ещё не запускалась
         $sw = [Diagnostics.Stopwatch]::StartNew()
+        $res = [int64]-1
         while ($sw.Elapsed.TotalSeconds -lt $TimeoutSec) {
-            $t = Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
-            if (-not $t -or $t.State -ne 'Running') { break }
             Start-Sleep -Milliseconds 500
+            $t = Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
+            $info = Get-ScheduledTaskInfo -TaskName $name -ErrorAction SilentlyContinue
+            if (-not $t -or -not $info) { break }
+            $res = [int64]$info.LastTaskResult
+            if ([string]$t.State -ne 'Running' -and $res -ne 267009 -and $res -ne 267011) { break }
         }
-        $info = Get-ScheduledTaskInfo -TaskName $name -ErrorAction SilentlyContinue
-        if ($info) { return [int]$info.LastTaskResult }
-        return -1
+        return $res
     } catch {
         Write-Log ('Не удалось выполнить действие от имени SYSTEM: ' + $_.Exception.Message) 'WARN'
         return -1

@@ -579,9 +579,11 @@ function Test-TcpEndpoint {
         $r.Blocked = $true
         return $r
     }
-    $c = New-Object Net.Sockets.TcpClient
+    $target = @($ips | Where-Object { $_.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetwork })[0]
+    if ($target) { $c = New-Object Net.Sockets.TcpClient([Net.Sockets.AddressFamily]::InterNetwork) }
+    else { $target = $ips[0]; $c = New-Object Net.Sockets.TcpClient([Net.Sockets.AddressFamily]::InterNetworkV6) }
     try {
-        $ar = $c.BeginConnect($ips[0], $Port, $null, $null)
+        $ar = $c.BeginConnect($target, $Port, $null, $null)
         if ($ar.AsyncWaitHandle.WaitOne($TimeoutMs)) {
             $c.EndConnect($ar)
             $r.Ok = $true
