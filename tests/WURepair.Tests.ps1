@@ -253,6 +253,34 @@ Describe 'Registry.pol (локальная групповая политика)'
     }
 }
 
+Describe 'Брандмауэр и резервные копии' {
+    It 'шаблон правил брандмауэра ловит блокировщики Windows' {
+        foreach ($n in @('WURepairTest Block Windows Update', 'DWS_Block_Telemetry', 'Block Microsoft IPs', 'Windows Update Blocker', 'O&O ShutUp10 rule', 'block_telemetry_1')) {
+            $n | Should -Match $script:FirewallSuspectPattern -Because $n
+        }
+    }
+    It 'шаблон не трогает посторонние правила' {
+        foreach ($n in @('BlockGoogleUpdate', 'Block Steam', 'Firefox update', 'Kaspersky block', 'Allow DNS', 'TeamViewer')) {
+            $n | Should -Not -Match $script:FirewallSuspectPattern -Because $n
+        }
+    }
+    It 'ConvertTo-RegFileText формирует корректный .reg' {
+        $vals = @(
+            [pscustomobject]@{ Name = 'SusClientId'; Kind = 'String'; Value = 'a\b"c' },
+            [pscustomobject]@{ Name = 'Num'; Kind = 'DWord'; Value = -1 },
+            [pscustomobject]@{ Name = 'Bin'; Kind = 'Binary'; Value = [byte[]](1, 171) },
+            [pscustomobject]@{ Name = 'Exp'; Kind = 'ExpandString'; Value = '%a%' }
+        )
+        $t = ConvertTo-RegFileText 'HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate' $vals
+        $t | Should -Match '^Windows Registry Editor Version 5\.00'
+        $t | Should -Match '\[HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\WindowsUpdate\]'
+        $t | Should -Match ([regex]::Escape('"SusClientId"="a\\b\"c"'))
+        $t | Should -Match '"Num"=dword:ffffffff'
+        $t | Should -Match '"Bin"=hex:01,ab'
+        $t | Should -Match '"Exp"=hex\(2\):25,00,61,00,25,00,00,00'
+    }
+}
+
 Describe 'Исходники' {
     BeforeAll {
         $root = Split-Path -Parent $PSScriptRoot

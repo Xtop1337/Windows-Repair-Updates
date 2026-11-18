@@ -57,6 +57,10 @@ New-NetFirewallRule -DisplayName 'WURepairTest Block Windows Update' -Direction 
 $routeAdded = @(Get-BlackholeRoutes (Get-PersistentRouteNames)).Count -gt 0
 Write-Host ('Тестовый маршрут добавлен: ' + $routeAdded)
 
+$foreignRules = @(Get-NetFirewallRule -Direction Outbound -Action Block -Enabled True -ErrorAction SilentlyContinue |
+    Where-Object { $_.DisplayName -notlike 'WURepairTest*' -and $_.DisplayName -notmatch $script:FirewallSuspectPattern } | ForEach-Object { $_.Name })
+Write-Host ('Посторонних блокирующих правил: ' + $foreignRules.Count)
+
 Write-Host '=== Диагностика (ожидаем найти всё сломанное) ==='
 $d1 = Invoke-Diagnostics -SkipScan
 Show-Findings $d1.Findings
@@ -76,6 +80,10 @@ Assert-That (Repair-Policies) 'Repair-Policies'
 Assert-That ((Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Services\wuauserv' 'Start') -ne 4) 'wuauserv больше не отключена'
 Assert-That (Repair-Hosts) 'Repair-Hosts'
 Assert-That (Repair-Firewall) 'Repair-Firewall'
+foreach ($n in $foreignRules) {
+    $r = Get-NetFirewallRule -Name $n -ErrorAction SilentlyContinue
+    Assert-That ($r -and [string]$r.Enabled -eq 'True') ('постороннее правило не тронуто: ' + $r.DisplayName)
+}
 if ($routeAdded) { Assert-That (Repair-Routes) 'Repair-Routes' }
 [void](Repair-UpdateTasks)
 Assert-That (Reset-WUComponents) 'Reset-WUComponents'

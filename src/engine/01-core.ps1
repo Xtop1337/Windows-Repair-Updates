@@ -329,6 +329,46 @@ function Backup-RegKey {
     return $true
 }
 
+# Текст .reg-файла только с указанными значениями (без подразделов —
+# защищённые подразделы не мешают потом импорту при откате).
+function ConvertTo-RegFileText {
+    param([string]$NativeKey, [object[]]$Values)
+    $hive = $NativeKey -replace '^HKLM\\', 'HKEY_LOCAL_MACHINE\' -replace '^HKCU\\', 'HKEY_CURRENT_USER\'
+    $hex = { param([byte[]]$b) (@($b | ForEach-Object { '{0:x2}' -f $_ }) -join ',') }
+    $lines = @('Windows Registry Editor Version 5.00', '', ('[' + $hive + ']'))
+    foreach ($v in $Values) {
+        $name = '"' + ($v.Name -replace '\\', '\\' -replace '"', '\"') + '"'
+        switch ([string]$v.Kind) {
+            'String'       { $lines += ($name + '="' + ([string]$v.Value -replace '\\', '\\' -replace '"', '\"') + '"') }
+            'DWord'        { $lines += ($name + '=dword:' + ('{0:x8}' -f [uint32]([int64]$v.Value -band 0xFFFFFFFFL))) }
+            'QWord'        { $lines += ($name + '=hex(b):' + (& $hex ([BitConverter]::GetBytes([int64]$v.Value)))) }
+            'Binary'       { $lines += ($name + '=hex:' + (& $hex ([byte[]]$v.Value))) }
+            'ExpandString' { $lines += ($name + '=hex(2):' + (& $hex ([Text.Encoding]::Unicode.GetBytes([string]$v.Value + [char]0)))) }
+            'MultiString'  { $lines += ($name + '=hex(7):' + (& $hex ([Text.Encoding]::Unicode.GetBytes(((@($v.Value) -join [char]0) + [char]0 + [char]0))))) }
+        }
+    }
+    return (($lines -join "`r`n") + "`r`n")
+}
+
+function Backup-RegValues {
+    param([string]$Path, [string[]]$Names, [string]$Tag)
+    try { $k = Get-Item -LiteralPath $Path -ErrorAction Stop } catch { return $false }
+    $vals = @()
+    foreach ($n in $Names) {
+        if ($k.GetValueNames() -notcontains $n) { continue }
+        $vals += [pscustomobject]@{ Name = $n; Kind = $k.GetValueKind($n); Value = $k.GetValue($n, $null, 'DoNotExpandEnvironmentNames') }
+    }
+    if ($vals.Count -eq 0) { return $true }
+    $file = Join-Path (Get-SessionBackupDir) ('reg_' + $Tag + '.reg')
+    try {
+        [IO.File]::WriteAllText($file, (ConvertTo-RegFileText (ConvertTo-NativeRegPath $Path) $vals), [Text.Encoding]::Unicode)
+        return $true
+    } catch {
+        Write-Log ('Не удалось сохранить копию значений ' + (ConvertTo-NativeRegPath $Path) + ': ' + $_.Exception.Message) 'WARN'
+        return $false
+    }
+}
+
 function Backup-File {
     param([string]$Path, [string]$Name)
     if (-not (Test-Path -LiteralPath $Path)) { return $false }

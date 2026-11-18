@@ -51,11 +51,13 @@ jobs:
         run: ./tests/Integration.Windows.ps1
 
       - name: Смоук-тест окна (.ps1)
+        if: success() || failure()
         timeout-minutes: 12
         shell: powershell
         run: ./tests/UiSmoke.ps1 -Script dist/WURepair.ps1 -Out screenshots/ui-ps1.png
 
       - name: Смоук-тест окна (.exe)
+        if: success() || failure()
         timeout-minutes: 12
         shell: powershell
         run: ./tests/UiSmoke.ps1 -Exe dist/WURepair.exe -Out screenshots/ui-exe.png

@@ -453,8 +453,9 @@ function Reset-WUComponents {
     Remove-Item -Path (Join-Path $env:ProgramData 'Microsoft\Network\Downloader\qmgr*.dat') -Force -ErrorAction SilentlyContinue
     $wuKey = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate'
     if (Test-Path -LiteralPath $wuKey) {
-        [void](Backup-RegKey $wuKey 'wu_client_ids')
-        foreach ($n in @('AccountDomainSid', 'PingID', 'SusClientId', 'SusClientIDValidation')) { [void](Remove-RegValue $wuKey $n -Quiet) }
+        $idNames = @('AccountDomainSid', 'PingID', 'SusClientId', 'SusClientIDValidation')
+        [void](Backup-RegValues $wuKey $idNames 'wu_client_ids')
+        foreach ($n in $idNames) { [void](Remove-RegValue $wuKey $n -Quiet) }
     }
     [void](Repair-ServiceSecurity)
     Write-Log 'Перерегистрирую библиотеки Центра обновления…' 'INFO'

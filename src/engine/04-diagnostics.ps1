@@ -445,7 +445,11 @@ function Test-PersistentRoutes {
 
 function Get-SuspectFirewallRules {
     $sus = @()
-    $rules = @(Get-NetFirewallRule -Direction Outbound -Action Block -Enabled True -ErrorAction Stop)
+    $fwErr = $null
+    $rules = @(Get-NetFirewallRule -Direction Outbound -Action Block -Enabled True -ErrorAction SilentlyContinue -ErrorVariable fwErr)
+    # «правил не найдено» — это не ошибка
+    $real = @($fwErr | Where-Object { $_.CategoryInfo.Category -ne 'ObjectNotFound' })
+    if ($rules.Count -eq 0 -and $real.Count -gt 0) { throw $real[0] }
     foreach ($r in $rules) {
         $why = $null
         $text = ([string]$r.DisplayName + ' ' + [string]$r.Description + ' ' + [string]$r.Group + ' ' + [string]$r.Name)

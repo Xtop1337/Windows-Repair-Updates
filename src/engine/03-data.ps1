@@ -181,6 +181,7 @@ $script:StorePackages = @(
 )
 
 # Правила брандмауэра, похожие на блокировку обновлений.
-$script:FirewallSuspectPattern = '(?i)(DWS|spy|telemetr|windows\s*update|wuauserv|winupdate|update\s*block|block.*(update|microsoft|windows|telemetr)|microsoft.*block|O&O|ShutUp|privacy|debloat|win10|windows10|wub|stopupdates|blackbird|destroy)'
+# Только явные признаки блокировки Windows/Microsoft (не трогаем, например, «BlockGoogleUpdate»).
+$script:FirewallSuspectPattern = '(?i)(\bDWS\b|DWS_|spy|telemetr|windows[\s_-]*update|wuauserv|winupdate|microsoft[\s_-]*update|block[\s_-]*(windows|microsoft|win10|telemetr)|(windows|microsoft)[\s_-]*block|O&O|ShutUp10|w10privacy|debloat|\bwin10\b|windows10|stopupdates|blackbird|destroy[\s_-]*windows)'
 $script:FirewallSuspectServices = @('wuauserv', 'bits', 'dosvc', 'usosvc', 'waasmedicsvc', 'cryptsvc', 'installservice', 'appxsvc', 'clipsvc', 'wlidsvc')
 $script:FirewallSuspectPrograms = '(?i)(\\svchost\.exe|\\wuauclt\.exe|\\usoclient\.exe|\\MoUsoCoreWorker\.exe|\\WinStore\.App\.exe|\\SIHClient\.exe|\\TiWorker\.exe|\\SetupHost\.exe)$'
